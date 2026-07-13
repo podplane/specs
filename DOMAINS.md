@@ -223,6 +223,7 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, and `k
 
 ## Future work
 
+- Add first-class cross-account DNS-provider references; initial Route53 support assumes the hosted zone is in the cluster AWS account.
 - Add Cloudflare DNS generation without changing the domain or load-balancer model.
 - Add Cloudflare `domains[].provider.proxied`, defaulting to false. Apply it to the exact Kubernetes API record only when `api_port` is 443.
 - Verify the split Cloudflare-proxied API/port-443 scenario, including origin TLS and Kubernetes streaming requests.
