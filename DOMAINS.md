@@ -53,11 +53,18 @@ Load balancers are a named map under each infrastructure provider. Domain and Ku
       "load_balancers": {
         "main": {
           "public": true,
-          "pool": "control-plane"
+          "subnets": "public",
+          "listeners": [
+            { "port": 443, "pool": "ingress" },
+            { "port": 6443, "pool": "control-plane" }
+          ]
         },
         "kubernetes-api": {
           "public": true,
-          "pool": "control-plane"
+          "subnets": "public",
+          "listeners": [
+            { "port": 443, "target_port": 6443, "pool": "control-plane" }
+          ]
         }
       }
     }]
@@ -67,13 +74,15 @@ Load balancers are a named map under each infrastructure provider. Domain and Ku
 
 `domains[].load_balancer` selects the target for that domain's apex and wildcard records and defaults to `main`. `kubernetes.api_load_balancer` independently selects the target for the exact API hostname. It has no implicit default: omitting it disables managed API load-balancer and DNS wiring. This permits the API and application ingress to share a load balancer, use separate load balancers, or leave API connectivity to custom infrastructure.
 
-Podplane derives listeners from how each load balancer is used:
+Each load balancer declares its listeners explicitly. A listener's `port` is the external port, `target_port` is the port on its target VMs and defaults to `port`, and `pool` selects the VMs registered with that listener's target group. The load balancer's `subnets` field independently selects its placement subnet role.
 
-- A domain adds the ingress listener `443 -> 443`.
-- The Kubernetes API adds `api_port -> 6443`.
-- Conflicting mappings for the same external port are invalid and require separate load balancers.
+Podplane validates the listeners required by higher-level configuration:
 
-When a domain is configured, the cluster-create wizard creates `main` and explicitly selects it for the Kubernetes API. Advanced config may define more load balancers. Arbitrary listeners remain a generated-Terraform customization rather than part of cluster config.
+- A domain requires `443 -> 443` on its selected load balancer.
+- The Kubernetes API requires `api_port -> 6443` targeting the `control-plane` pool on its selected load balancer.
+- Listener ports must be unique within a load balancer.
+
+When a domain is configured, the cluster-create wizard creates `main` with explicit ingress and Kubernetes API listeners and selects it for the Kubernetes API. Advanced config may define more load balancers and arbitrary listeners.
 
 ## DNS records
 
@@ -108,7 +117,7 @@ When `api_load_balancer` is set, the API hostname gets an exact DNS record targe
 
 For domain-configured clusters, the wizard exposes the Kubernetes API publicly by selecting the public `main` load balancer. The wizard does not ask about exposure. Advanced users may select a private load balancer or omit `api_load_balancer` and provide connectivity through custom security groups, VPN, tunnel, jump host, or Terraform.
 
-The default API port is 6443. Setting it to 443 derives a load-balancer mapping from port 443 to kube-apiserver port 6443.
+The default API port is 6443. Setting it to 443 requires an explicit load-balancer listener from port 443 to kube-apiserver port 6443.
 
 For Cloudflare, `domains[].provider.proxied` controls whether that domain's records are proxied and defaults to false. The exact Kubernetes API record is proxied if and only if the default domain sets `proxied` to true and `api_port` is 443; otherwise it is DNS-only.
 
@@ -158,7 +167,7 @@ The wizard asks only:
 2. Its DNS provider when a domain is entered; the provider may be left unset for manual DNS.
 3. The Kubernetes API hostname when the domain is left blank.
 
-With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, and `kubernetes.api_load_balancer: "main"` explicitly. Without a domain, it writes the supplied API hostname and leaves load-balancer and DNS wiring to the user. The domain may omit its load-balancer reference because it defaults to `main`. Multiple domains, load balancers, and provider-specific advanced settings remain cluster-config edits.
+With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kubernetes.api_load_balancer: "main"`, and a public `main` load balancer with explicit ingress and Kubernetes API listeners. Without a domain, it writes the supplied API hostname and leaves load-balancer and DNS wiring to the user. The domain may omit its load-balancer reference because it defaults to `main`. Multiple domains, load balancers, and provider-specific advanced settings remain cluster-config edits.
 
 ## Implementation plan
 
@@ -168,9 +177,10 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, and `k
 - Validate domain names, reject duplicates, and always require `kubernetes.api_hostname`.
 - Keep the first domain as the default without adding another field.
 - Preserve the existing flat Kubernetes and registry fields.
-- Replace the singular provider `load_balancer` with a named `load_balancers` map whose entries specify `public` and `pool`.
+- Replace the singular provider `load_balancer` with a named `load_balancers` map whose entries specify `public`, `subnets`, and explicit listeners.
+- Keep `port`, optional `target_port`, and `pool` on each listener so every target group registers VMs from the selected pool.
 - Add `domains[].load_balancer`, defaulting to `main`, and optional `kubernetes.api_load_balancer` references; validate configured references resolve.
-- Derive ingress and API listener mappings from load-balancer references and reject external-port conflicts.
+- Validate that domain and API load-balancer references have their required listener mappings and reject duplicate external ports.
 - Add resolved helpers for the default domain and domainless registry hostname.
 
 ### 2. Extend the cluster-create wizard
@@ -184,7 +194,8 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, and `k
 
 ### 3. Expose the load-balancer DNS target
 
-- Extend the Nstance network module input to accept Podplane's derived listener-to-target port mappings.
+- Extend the Nstance network module input to accept Podplane's explicit listener-to-target port mappings.
+- Preserve listener identity through target-group outputs so each pool registers only with its configured listeners.
 - Extend each Nstance load-balancer output with its canonical hosted-zone ID in addition to its existing DNS name.
 - Preserve named load-balancer keys through Podplane's generated Terraform and Nstance modules.
 
@@ -216,7 +227,7 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, and `k
 ### 7. Verify end-to-end behavior
 
 - Add config parsing, validation, JSON Schema, wizard, Terraform generation, and Netsyseed tests.
-- Cover domainless explicit API hostnames, missing API hostname validation, no managed API load balancer, manual DNS, Route53, multiple domains, multiple load balancers, derived target-port mappings, port conflicts, and explicit hostname overrides.
+- Cover domainless explicit API hostnames, missing API hostname validation, no managed API load balancer, manual DNS, Route53, multiple domains, multiple load balancers, explicit target-port mappings, missing required listeners, duplicate ports, listener-specific pools, and explicit hostname overrides.
 - Include the shared AWS load-balancer/port-6443 scenario as an acceptance test.
 - Verify generated DNS outputs, kubeconfig connectivity, mutable API hostname updates, node-local registry pulls, port-forwarded pushes, and optional registry ingress.
 - Validate/lint generated Terraform for each supported infrastructure/DNS-provider combination before advertising that combination.
