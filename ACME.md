@@ -57,7 +57,7 @@ Generated OpenTofu/Terraform creates a dedicated cert-manager Route53 role in th
 - scopes record changes to the Terraform-resolved hosted zones and restricts them to `UPSERT` and `DELETE` actions;
 - can be assumed through kube2iam by the IAM role attached to cluster VMs via Nstance's agent instance profile.
 
-The cert-manager controller receives the role through the `iam.amazonaws.com/role` kube2iam pod annotation. Its namespace restricts allowed kube2iam roles to the generated role through `iam.amazonaws.com/allowed-roles`. Generated Terraform passes the role ARN and resolved hosted-zone IDs through the seed resource's provider-neutral values overlay without persisting credentials or generated ARNs in cluster config. The Route53 solver uses AWS credentials supplied to cert-manager by kube2iam and the resolved zone IDs; the user does not configure a role ARN.
+The cert-manager controller receives the role through the `iam.amazonaws.com/role` kube2iam pod annotation. Its namespace restricts allowed kube2iam roles to the generated role through `iam.amazonaws.com/allowed-roles`. Generated Terraform passes the role ARN and resolved hosted-zone IDs through the seed resource's provider-neutral `values_content` overlay without persisting credentials or generated ARNs in cluster config. An optional user-authored `values_file` is applied last. The Route53 solver uses AWS credentials supplied to cert-manager by kube2iam and the resolved zone IDs; the user does not configure a role ARN.
 
 ## Issuance behavior
 
