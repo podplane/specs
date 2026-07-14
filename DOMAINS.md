@@ -19,7 +19,7 @@ For example, this domain:
       {
         "zone": "staging.example.com",
         "provider": {
-          "kind": "aws"
+          "kind": "aws-route53"
         },
         "load_balancer": "main"
       }
@@ -157,7 +157,7 @@ Domainless clusters use the existing internal registry hostname `<cluster-id>-re
 
 The Kubernetes API uses its Podplane cluster CA, which the CLI places in kubeconfig.
 
-Initial domain support configures DNS and may use bootstrap self-signed ingress certificates. Public ACME certificates, wildcard issuance, cert-manager DNS-01 credentials, and renewal behavior are later work. They should build on the DNS provider model in this specification without coupling DNS to the infrastructure provider.
+Ingress starts with temporary bootstrap certificates. Domains using a supported ACME DNS provider can use publicly trusted apex and wildcard certificates; manual domains and unsupported DNS providers continue using the self-signed ingress issuer. See [ACME.md](./ACME.md) for configuration, credentials, issuance, and renewal behavior.
 
 ## Cluster-create wizard
 
@@ -165,9 +165,10 @@ The wizard asks only:
 
 1. The cluster domain, which may be left blank to skip domain configuration.
 2. Its DNS provider when a domain is entered; the provider may be left unset for manual DNS.
-3. The Kubernetes API hostname when the domain is left blank.
+3. The optional ACME account email when the selected DNS provider supports ACME.
+4. The Kubernetes API hostname when the domain is left blank.
 
-With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kubernetes.api_load_balancer: "main"`, and a public `main` load balancer with explicit ingress and Kubernetes API listeners. Without a domain, it writes the supplied API hostname and leaves load-balancer and DNS wiring to the user. The domain may omit its load-balancer reference because it defaults to `main`. Multiple domains, load balancers, and provider-specific advanced settings remain cluster-config edits.
+With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kubernetes.api_load_balancer: "main"`, and a public `main` load balancer with explicit ingress and Kubernetes API listeners. A supplied ACME email also writes `cluster.acme`; leaving it blank keeps self-signed ingress certificates. Without a domain, it writes the supplied API hostname and leaves load-balancer and DNS wiring to the user. The domain may omit its load-balancer reference because it defaults to `main`. Multiple domains, load balancers, and provider-specific advanced settings remain cluster-config edits.
 
 ## Implementation plan
 
@@ -222,7 +223,7 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kuber
 - Continue passing all configured domains to the Traefik component, with the first marked as its default.
 - Ensure no ingress, cert-manager, or Traefik components are enabled solely because a domain is absent.
 - Keep registry ingress disabled unless explicitly enabled; when enabled, route `registry.<default-domain>` through the default domain's selected load balancer.
-- Keep ACME and cert-manager DNS-01 automation as follow-up work.
+- Keep ACME and cert-manager DNS-01 automation aligned with [ACME.md](./ACME.md), including per-domain issuer selection.
 
 ### 7. Verify end-to-end behavior
 
