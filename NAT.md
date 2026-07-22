@@ -7,7 +7,7 @@ Podplane can use either Cloud Managed NAT or Podplane Managed NAT VMs without ch
 ## Network model
 
 - Node IPv4 subnets are `/26`, providing 59 usable addresses on AWS and 60 on Google Cloud.
-    - Nstance's algorithm should aim to fill a sorted subnet list one-at-a-time until that subnet reaches 90% of its allocation, targeting about 50–53 nodes per subnet.
+    - Nstance conservatively calculates usable capacity as the subnet size minus AWS's five reserved addresses on both providers. It fills each sorted subnet to 90% of that capacity before using the next, targeting 53 nodes for `/26`.
     - Once all configured subnets are at 90%, it should round-robin until it finds an available slot.
     - As you will learn, this will reduce the total number of required Podplane Managed NAT instances.
 - Each populated node subnet has one NAT next hop. One configured subnet may optionally use the elected shard leader; other subnets use dedicated NAT VMs in a public/NAT service subnet in the same zone.
