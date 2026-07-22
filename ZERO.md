@@ -65,17 +65,51 @@ Exactly one node is the initial default, not an Nstance limitation. nstance-oper
 
 External kube-apiserver exposure remains direct and never depends on Traefik.
 
-Nstance derives activity ports from the proxy listeners generated from load-balancer and tunnel configuration. An agent reports fixed, low-cardinality counters for each configured listener whose group matches that instance:
+Each control-plane or ingress node uses eBPF to count active TCP connections on the production ports appropriate to its role:
 
-- cumulative bytes and packets;
-- active data-bearing TCP connections;
-- last activity time for each port.
+- control-plane only: kube-apiserver port 6443;
+- ingress only: Traefik port 443;
+- combined control-plane and ingress: ports 6443 and 443.
 
-Only externally originated traffic counts. Classification covers direct public-client sources, AWS NLB addresses used for IPv6-to-IPv4 translation, and configured `nst`/cloudflared connector addresses while excluding other cluster/VPC traffic. Observation must cover Cilium's eBPF host-port path rather than assuming netfilter conntrack. Reports contain only counters and timestamps, never client addresses or connection tuples.
+Podplane supplies these roles through generated Nstance group configuration, and vmconfig initializes only the corresponding port keys. This supports clusters where control-plane and ingress instances share a group or use separate groups.
 
-Every configured listener participates in `if_not_busy`; no separate activity flag is required. TCP load-balancer health probes normally establish a connection without application payload and therefore do not count. An active data-bearing connection keeps the node busy, conservatively preserving Kubernetes watches, exec, logs, and port-forwarding.
+### Loading and pinning
 
-Unsupported or stale activity telemetry is treated as busy, never idle.
+vmconfig installs Debian's `bpftool` and a root-owned systemd oneshot service on control-plane and ingress nodes. The service loads the vmconfig-supplied ELF, infers tracepoint attachments from section names, uses `autoattach` to pin the resulting BPF links, and uses `pinmaps` to pin maps separately:
+
+```text
+/sys/fs/bpf/nstance/counters/
+├── links/
+└── maps/
+    └── active_connections
+```
+
+Both links and maps are pinned: maps remain readable independently, while links keep programs attached after bpftool exits. The service grants nstance-agent read access only to the pins it must validate and the counter map. nstance-agent remains unprivileged and never loads or modifies BPF objects.
+
+### Agent reporting
+
+vmconfig enables collection with:
+
+```ini
+NSTANCE_EBPF_COUNTERS_PATH=/sys/fs/bpf/nstance/counters
+```
+
+nstance-agent validates the pinned links, opens `maps/active_connections` read-only using `cilium/ebpf`, and includes every map entry in its normal health report:
+
+```jsonc
+{
+  "ebpf_counters": {
+    "443": 0,
+    "6443": 0
+  }
+}
+```
+
+If link validation or a configured map read fails, the report includes `ebpf_error`; otherwise the error is omitted. If the environment variable is unset, or a valid map has no entries, no counters are reported and sleep is not blocked.
+
+### Final sleep guard
+
+`SleepTenant(if_not_busy=true)` checks every remaining tenant instance in the local shard using standard agent-health freshness. A non-empty `ebpf_error` or any nonzero reported counter refuses the entire shard's sleep; zero or absent counters permit it. No server-side sleep configuration is required. Forced sleep bypasses this check. Reports never include client addresses or connection tuples.
 
 ## CronJob wake deadlines
 
@@ -120,9 +154,9 @@ Normal sleep applies the automatic-sleep guards. `--force` bypasses node-count, 
 
 - **Nstance operator:** configurable Kubernetes eligibility, Job/CronJob evaluation, wake deadlines, all-shard sleep ordering, and post-wake MachinePool restoration.
 - **Nstance server:** durable per-tenant shard state, timers, final busy check, and local reconciliation.
-- **Nstance agent:** privacy-preserving activity counters for configured proxy listeners.
-- **vmconfig:** `knc`/`nst` tunnel services, `nst` kind, optional `nstance-proxy`, and secret receive watchers.
+- **Nstance agent:** read-only pinned-map collection and eBPF counter/error reporting.
+- **vmconfig:** `knc`/`knd` BPF object, bpftool oneshot loader, pin permissions, `knc`/`nst` tunnel services, `nst` kind, optional `nstance-proxy`, and secret receive watchers.
 - **Podplane CLI:** generated sleep policy and the annotation-based sleep command.
 - **Components:** deploy/configure nstance-operator and the required operator permissions.
 
-Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, stale metrics, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, forced sleep, and NAT dependencies.
+Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, zero, nonzero, absent, failed, and stale eBPF reports, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, forced sleep, and NAT dependencies.
