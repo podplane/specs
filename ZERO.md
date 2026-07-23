@@ -35,7 +35,7 @@ Nstance adds idempotent operations:
 
 This includes the tenant's configured NAT group in that shard. On wake, normal reconciliation restores desired sizes; NAT dependencies ensure required NAT instances become healthy before nodes launch. `nstance-proxy` uses configured listener-to-group mappings and needs no previous-size knowledge.
 
-The shard leader reconciles its local record and resumes unfinished work after leadership changes. Nstance does not coordinate sleep/wake through the cluster leader or contact other shards.
+The shard leader reconciles its local record and resumes unfinished work after leadership changes. Nstance does not coordinate tenant sleep state through the cluster leader or contact other shards. On AWS, shard leaders independently enable the shared target groups' cross-zone setting before sleep; the cluster leader coordinates only safely disabling it again as described in [LB.md](./LB.md). This does not change shard-local tenant state ownership.
 
 ## Supported topologies
 
@@ -105,11 +105,13 @@ nstance-agent validates the pinned links, opens `maps/active_connections` read-o
 }
 ```
 
-If link validation or a configured map read fails, the report includes `ebpf_error`; otherwise the error is omitted. If the environment variable is unset, or a valid map has no entries, no counters are reported and sleep is not blocked.
+If link validation or a configured map read fails, the report includes `ebpf_error`; otherwise the error is omitted. If the environment variable is unset, or a valid map has no entries, no counters are reported. For an instance in a group referenced by a proxy listener, an error or missing expected port blocks normal sleep; Nstance derives those ports from the listener configuration. Other instances need no counters.
 
 ### Final sleep guard
 
-`SleepTenant(if_not_busy=true)` checks every remaining tenant instance in the local shard using standard agent-health freshness. A non-empty `ebpf_error` or any nonzero reported counter refuses the entire shard's sleep; zero or absent counters permit it. No server-side sleep configuration is required. Forced sleep bypasses this check. Reports never include client addresses or connection tuples.
+Periodic agent reports provide the initial inactivity signal. For the final guard, `SleepTenant(if_not_busy=true)` establishes the proxy path and starts the provider-specific production-target withdrawal described in [LB.md](./LB.md). Once the provider confirms that production targets are draining and receive no new connections, Nstance waits for a subsequent normal health report from each remaining relevant agent.
+
+Nstance refuses sleep if a required report is missing, contains `ebpf_error`, reports a nonzero active count, or if proxy payload arrives during the transition. On refusal, Nstance restores production routing before withdrawing the proxy path. Otherwise it waits for production targets to finish deregistering, commits the desired state to `asleep`, and begins instance termination. Forced sleep bypasses this guard. Reports never include client addresses or connection tuples.
 
 ## CronJob wake deadlines
 
@@ -159,4 +161,4 @@ Normal sleep applies the automatic-sleep guards. `--force` bypasses node-count, 
 - **Podplane CLI:** generated sleep policy and the annotation-based sleep command.
 - **Components:** deploy/configure nstance-operator and the required operator permissions.
 
-Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, zero, nonzero, absent, failed, and stale eBPF reports, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, forced sleep, and NAT dependencies.
+Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, zero, nonzero, absent, failed, and stale eBPF reports, traffic during production-target draining, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, forced sleep, and NAT dependencies.

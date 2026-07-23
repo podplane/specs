@@ -58,13 +58,18 @@ AWS configuration names every target group and its public, production, and proxy
 }
 ```
 
-Google Cloud configuration names one zonal `GCE_VM_IP` NEG and its passthrough frontends:
+Terraform creates one regional AWS target group for each exposed listener: Traefik ports 80 and 443 and the configured kube-apiserver listener. The same target-group ARNs are passed to every shard. Shard leaders register and deregister only their local production and proxy targets; target groups are not duplicated per Availability Zone or shard.
+
+Google Cloud configuration lists its zonal `GCE_VM_IP` NEGs and passthrough frontends. The list includes every eligible production subnet and the Nstance server subnet without repeating those subnet IDs:
 
 ```jsonc
 "load_balancers": {
   "control-plane": {
     "provider": "gcp",
-    "network_endpoint_group": "control-plane-us-central1-a",
+    "network_endpoint_groups": [
+      "control-plane-us-central1-a",
+      "control-plane-nstance-us-central1-a"
+    ],
     "frontends": [{
       "ip": "34.10.20.30",
       "port": 6443
@@ -72,6 +77,8 @@ Google Cloud configuration names one zonal `GCE_VM_IP` NEG and its passthrough f
   }
 }
 ```
+
+At startup and configuration reload, Nstance reads each configured NEG from Google Cloud and uses its immutable subnetwork metadata to build the subnet-to-NEG lookup for that logical load balancer. Validation requires each NEG to use `GCE_VM_IP`, belong to the shard's zone, and map to a unique subnet within the logical load balancer. Terraform creates the NEGs, attaches them to the regional backend service, and passes only their names to Nstance. Multiple shards sharing a zone and subnet receive the same NEG name and independently mutate only their own endpoints.
 
 Tunnel configuration names only production and local proxy ports:
 
@@ -120,17 +127,25 @@ Every derived listener is a wake trigger and activity source. Validation rejects
 
 Podplane-generated Terraform supports equivalent AWS and Google Cloud behavior using provider-native resources. A `load_balancers` key is a logical set of backends with common membership, not necessarily a physical load balancer.
 
-AWS uses one target group per listener and may send production and `nstance-proxy` traffic to different target ports through a registration override. Google Cloud uses a regional external passthrough Network Load Balancer with one `GCE_VM_IP` zonal NEG per logical membership set and zone; several frontends may share that NEG. A backend service cannot mix instance groups and NEGs. While awake, Nstance registers production VM interfaces; while asleep, it registers the shard leader's interface. Google Cloud preserves the forwarding-rule IP and port, so its listener, production, and proxy ports are equal; separate load balancers may reuse that port because their forwarding-rule IPs distinguish tenants.
+AWS uses one regional target group per listener, shared by all shards and Availability Zones, and may send production and `nstance-proxy` traffic to different target ports through a registration override. Cross-zone load balancing is disabled on these target groups during normal awake operation. Because a sleeping tenant may have a wake-capable proxy target in only one shard, the shard leader beginning sleep idempotently enables cross-zone load balancing on all of its target groups and waits for provider confirmation before withdrawing production targets.
+
+Enabling cross-zone load balancing requires no cluster-wide coordination because concurrent enable operations are idempotent. The Nstance cluster leader coordinates only its re-disablement: after Kubernetes is awake, production routing has been restored, and proxy targets have been removed in every shard, it disables cross-zone load balancing on all target groups. This decision is serialized against new sleep transitions so the cluster leader cannot disable the setting after a shard has enabled it for sleep. Cross-zone control requires `elasticloadbalancing:ModifyTargetGroupAttributes` scoped to the configured target groups; shard leaders continue to own only their local target membership.
+
+Google Cloud uses `GCE_VM_IP` NEGs instead of unmanaged instance groups because a Compute Engine VM can belong to only one instance group. The same VM interface can be represented as an endpoint in multiple NEGs, and the same NEG can back multiple backend services. This allows one VM—particularly an Nstance proxy—to participate in multiple logical load balancers without coupling their membership. It also permits separate NEGs for Traefik ingress on port 443 and kube-apiserver traffic on port 6443, regardless of whether they are backed by one Nstance group or separate groups.
+
+Google Cloud uses a regional external passthrough Network Load Balancer with one `GCE_VM_IP` zonal NEG per logical membership set, zone, and eligible subnet. Terraform attaches all of those NEGs to the logical load balancer's regional backend service; a backend service cannot mix instance groups and NEGs. While awake, Nstance registers each production VM interface with the configured NEG whose discovered subnetwork matches the interface. While asleep, it registers the shard leader's interface with the NEG matching the Nstance server subnet. Google Cloud preserves the forwarding-rule IP and port, so its listener, production, and proxy ports are equal; separate load balancers may reuse that port because their forwarding-rule IPs distinguish tenants.
 
 Google Cloud forwarding-rule IPs are generated provider metadata, not addresses assigned to the backend VM. `nstance-proxy` listens on `0.0.0.0:<proxy_port>` and uses the accepted connection's local address to select the configured listener. Terraform must create firewall rules for client traffic and health checks. A future provider option may add Google Cloud proxy Network Load Balancers when port translation is required.
 
 Sleep transition:
 
 1. register the wake-capable shard leader's `nstance-proxy` target and wait for provider acceptance while production remains registered;
-2. during this overlap, `nstance-proxy` forwards to the existing production upstream and any arrival participates in the final `if_not_busy` check;
-3. if traffic arrives, deregister `nstance-proxy` and abort; otherwise deregister production targets and commit sleep.
+2. deregister the production targets with connection draining enabled while `nstance-proxy` remains registered and can forward to the existing upstream;
+3. once the provider confirms that production targets are draining and receive no new connections, wait for the next normal agent report and perform the final `if_not_busy` check described in [ZERO.md](./ZERO.md);
+4. if proxy payload arrived, a connection remains active, or a required report failed, restore production registration before deregistering `nstance-proxy` and aborting;
+5. otherwise wait for production targets to finish deregistering, commit sleep, and terminate production instances.
 
-The final sleep decision and `WakeTenant` are serialized by the tenant transition lock. A proxy arrival either aborts pending sleep or, if sleep commits first, immediately wakes the tenant.
+The final sleep decision and `WakeTenant` are serialized by the tenant transition lock. A proxy arrival either aborts pending sleep or, if sleep commits first, immediately wakes the tenant. Provider API acceptance alone is not the withdrawal barrier: the provider adapter must wait for the target or endpoint to finish draining and reach its fully deregistered state.
 
 Wake transition:
 
@@ -139,7 +154,9 @@ Wake transition:
 3. during this overlap, either path may serve traffic;
 4. deregister `nstance-proxy` targets while allowing their active connections to drain.
 
-nstance-server performs target membership changes because it already owns instance lifecycle and limits cloud API access to one security boundary. IAM permissions must be scoped to the cluster's target groups and NEGs.
+On AWS, the cluster leader disables target-group cross-zone load balancing only after step 4 has completed for the cluster. This ordering prevents an NLB node in an Availability Zone without a wake-capable target from losing its route during wake.
+
+nstance-server performs target membership changes because it already owns instance lifecycle and limits cloud API access to one security boundary. IAM permissions must be scoped to the cluster's target groups and NEGs; Google Cloud additionally grants the NEG read permission required to resolve each configured NEG's subnet.
 
 The design must account for provider fail-open behaviour and must never intentionally leave both production and `nstance-proxy` registration sets empty during transition. `nstance-proxy` health checks must not invoke `WakeTenant`; payload activity on production ports remains the sleep guard described in [ZERO.md](./ZERO.md).
 
@@ -177,7 +194,9 @@ Nstance publishes generic connector state by logical load-balancer key, such as 
 
 Cloudflare replicas using one tunnel credential provide availability but no traffic steering. Therefore control-plane and `nstance-proxy` connectors may overlap only during transitions, when both paths can serve requests; the `nstance-proxy` connector must be withdrawn while the tenant is awake so normal traffic bypasses `nstance-proxy`.
 
-The initial Cloudflare implementation uses locally managed ingress rules so control-plane connectors can target local ports 6443/443 while the `nst` connector targets local `nstance-proxy`, despite sharing one tunnel credential.
+The initial Cloudflare implementation uses public HTTPS applications, not Cloudflare's arbitrary-TCP client mode. Clients connect to Cloudflare's HTTPS edge on port 443 without `cloudflared`; Cloudflare terminates client TLS and sends HTTPS through the tunnel to kube-apiserver on local port 6443 or Traefik on local port 443. The `nst` connector sends the same HTTPS origin traffic to local `nstance-proxy`, which transparently forwards it to the selected production port after wake. Locally managed ingress rules allow the control-plane and `nst` connectors to use these different local targets despite sharing one tunnel credential.
+
+Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and content. In tunnel mode, Podplane generates the kubeconfig API URL on external port 443 and relies on the operating system's public CA roots for the Cloudflare edge certificate instead of embedding the kube-apiserver CA. Cloudflare-to-origin connections remain TLS-protected. For the API route, vmconfig configures `cloudflared` with the Podplane cluster CA and API hostname. For ingress routes, it uses the configured ingress issuer CA or public roots and the ingress hostname. TLS verification must not be disabled.
 
 ## Proxy files and tunnel secrets
 
@@ -205,4 +224,4 @@ Scale-to-zero requires an exposure method capable of reaching `nstance-proxy`, u
 - **vmconfig:** `knc`/`nst` tunnel services, optional `nstance-proxy`, local routing, and secret watchers.
 - **Components/Traefik:** retain control-plane host exposure on port 443 for tunnels and ports 80/443 for NLBs; no kube-apiserver proxying.
 
-Tests must cover shared and separate listener groups, same-tenant shared and cross-tenant rejected load balancers, AWS proxy-port uniqueness, Google Cloud forwarding-rule-address dispatch and equal-port validation, derived proxy-file generation, initial secret-miss coalescing, AWS target groups, Google Cloud `GCE_VM_IP` NEGs, tunnel mode, one and multiple wake-capable shards, zero-sized group exclusion, partial upstream health, shard-leader replacement, bounded connection holding, direct kube-apiserver access, and sleep/wake transitions without empty registration sets.
+Tests must cover shared and separate listener groups, same-tenant shared and cross-tenant rejected load balancers, AWS regional target groups shared across shards and Availability Zones, proxy-port uniqueness, cross-zone enable-before-sleep and disable-after-wake ordering, cluster-leader replacement during each transition, Google Cloud forwarding-rule-address dispatch and equal-port validation, derived proxy-file generation, initial secret-miss coalescing, Google Cloud `GCE_VM_IP` NEG metadata resolution and subnet selection, shared same-zone NEG membership, public-HTTPS tunnel kubeconfig and origin verification, one and multiple wake-capable shards, zero-sized group exclusion, partial upstream health, shard-leader replacement, bounded connection holding, direct kube-apiserver access, and sleep/wake transitions without empty registration sets.
