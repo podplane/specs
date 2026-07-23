@@ -69,11 +69,11 @@ The all-shard operation is compensating rather than atomic. If any shard rejects
 
 External kube-apiserver exposure remains direct and never depends on Traefik.
 
-Each control-plane or ingress node uses eBPF to count active TCP connections on every production target port derived from the Nstance group's referenced `load_balancers` listeners. vmconfig initializes the union of those listener ports for the group. Standard NLB ingress therefore counts ports 80 and 443, tunnel ingress counts port 443, kube-apiserver exposure counts port 6443, and a group serving multiple roles counts their union. The listener-derived configuration supports clusters where control-plane and ingress instances share a group or use separate groups without duplicating the port model in role configuration.
+Each Kubernetes group that can participate in guarded normal sleep uses eBPF to count active TCP connections on every production target port derived from its referenced `load_balancers` listeners. vmconfig configures ingress ports only, kube-apiserver port 6443 only, their union for a group serving both roles, or no accounting for a group serving neither role. Standard NLB ingress therefore counts ports 80 and 443, while tunnel ingress counts port 443. This listener-derived configuration supports shared or separate control-plane and ingress groups without duplicating the port model in role configuration.
 
 ### Loading and pinning
 
-vmconfig installs Debian's `bpftool` and a root-owned systemd oneshot service on control-plane and ingress nodes. The service loads the vmconfig-supplied ELF, infers tracepoint attachments from section names, uses `autoattach` to pin the resulting BPF links, and uses `pinmaps` to pin maps separately:
+For groups requiring accounting, vmconfig installs Debian's `bpftool` and a root-owned systemd oneshot service. The service loads the vmconfig-supplied ELF, ignores ports outside the listener-derived set, infers tracepoint attachments from section names, uses `autoattach` to pin the resulting BPF links, and uses `pinmaps` to pin maps separately:
 
 ```text
 /sys/fs/bpf/nstance/counters/
@@ -82,7 +82,7 @@ vmconfig installs Debian's `bpftool` and a root-owned systemd oneshot service on
     └── active_connections
 ```
 
-Both links and maps are pinned: maps remain readable independently, while links keep programs attached after bpftool exits. The service grants nstance-agent read access only to the pins it must validate and the counter map. nstance-agent remains unprivileged and never loads or modifies BPF objects.
+Both links and maps are pinned: maps remain readable independently, while links keep programs attached after bpftool exits. The service grants nstance-agent read access only to the pins it must validate and the counter map. nstance-agent remains unprivileged and never loads or modifies BPF objects. When accounting is disabled, vmconfig does not fetch or install `bpftool`, enable the loader, attach programs, create pins, or configure agent collection.
 
 ### Agent reporting
 
@@ -133,9 +133,17 @@ Wake is deduplicated within a shard by a durable compare-and-swap that removes t
 4. Nstance waits for any configured group to provide an agent-healthy instance with the target port ready, then returns its private address.
 5. `nstance-proxy` forwards held connections to that address.
 6. Once Kubernetes starts, nstance-operator wakes any other shards required by MachinePools.
-7. Nstance waits for production NLB targets to become provider-health-check healthy and routable, or for the production tunnel connector to become active and ready, then bypasses `nstance-proxy`; existing proxied connections may finish there. If readiness times out, it retains the proxy path and continues reconciliation.
+7. Nstance waits for production NLB targets to become provider-health-check healthy and routable, or for the production tunnel process to become active and ready, then bypasses `nstance-proxy`; existing proxied connections may finish there. If readiness times out, it retains the proxy path and continues reconciliation.
 
 The local `nstance-proxy` can invoke only `WakeTenant` over a root-owned Unix socket. Nstance-server remains inaccessible from the public network.
+
+## Operator registration bootstrap
+
+Podplane supports scale-to-zero only for AWS and Google Cloud clusters using the `recommended` seed. nstance-operator requires Nstance CRDs, Cluster API core and CRDs, and cert-manager and its CRDs; this dependency graph is not added to `minimal` or `none`.
+
+For supported clusters, Terraform conditionally creates or adopts Nstance's registration signing key, then the cluster-specific Netsy seed creation operation reads that key in memory, mints a tenant- and cluster-scoped single-use nonce with a 30-minute TTL, and inserts the nonce as a dedicated Kubernetes Secret. It reads the signing key only when creating the seed; refresh and completed-seed adoption use non-secret metadata. The public CA is seeded separately as a ConfigMap. Neither the signing key nor nonce appears in generic seeds, Terraform schema values/state/output, logs, diagnostics, command arguments, or temporary files.
+
+nstance-operator deletes the nonce Secret only after durably storing and verifying its key and certificate. Registration is idempotent for the same operator key after a lost response. An expired nonce on a live, unregistered cluster is replaced manually using the Nstance admin nonce command and `kubectl`; a cluster that never becomes live is destroyed and recreated. Initial seeds are never re-uploaded over live Netsy state.
 
 ## CLI
 
@@ -155,8 +163,8 @@ Normal sleep applies the automatic-sleep guards. `--force` bypasses node-count, 
 - **Nstance operator:** configurable Kubernetes eligibility, Job/CronJob evaluation, wake deadlines, all-shard sleep ordering, and post-wake MachinePool restoration.
 - **Nstance server:** durable per-tenant shard state, timers, final busy check, and local reconciliation.
 - **Nstance agent:** read-only pinned-map collection and eBPF counter/error reporting.
-- **vmconfig:** `knc`/`knd` BPF object, bpftool oneshot loader, pin permissions, `knc`/`nst` tunnel services, `nst` kind, optional `nstance-proxy`, and secret receive watchers.
+- **vmconfig:** optional `knc`/`knd` BPF accounting, bpftool oneshot loader, pin permissions, `knc`/`nst` tunnel services, `nst` kind, optional `nstance-proxy`, and secret receive watchers.
 - **Podplane CLI:** generated sleep policy and the annotation-based sleep command.
 - **Components:** deploy/configure nstance-operator and the required operator permissions.
 
-Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, durable compensation when a later shard rejects or fails, operator restart during compensation, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, listener-derived port sets including NLB ingress port 80, zero, nonzero, absent, failed, and stale eBPF reports, traffic during production-target draining, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, forced sleep, and NAT dependencies.
+Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, durable compensation when a later shard rejects or fails, operator restart during compensation, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, listener-derived port sets including NLB ingress port 80, zero, nonzero, absent, failed, and stale eBPF reports, traffic during production-target draining, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, forced sleep, NAT dependencies, signing-key/seed create-or-adopt after interrupted applies, signing-key reads only during seed creation, lost registration responses, and bootstrap Secret deletion after durable certificate storage.

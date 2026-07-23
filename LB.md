@@ -15,7 +15,7 @@ While Kubernetes is awake:
 
 - NLB ports 80 and 443 route directly to Traefik on cluster nodes;
 - the NLB's configured external API port, defaulting to 6443, routes directly to kube-apiserver port 6443 on control-plane nodes;
-- tunnel connectors run on control-plane VMs and use local kube-apiserver and Traefik ports.
+- tunnel processes run on control-plane VMs and use local kube-apiserver and Traefik ports.
 
 Kube-apiserver must not depend on Traefik for ingress, because a broken ingress controller must not lock administrators out of the cluster.
 
@@ -188,13 +188,13 @@ No separate ingress-node role, Traefik sidecar, or live upstream discovery is re
 
 Tunnel providers handle public HTTP-to-HTTPS redirects at their edge and do not forward port 80 to Traefik. The initial Cloudflare implementation uses a hostname-scoped redirect rule; a future ngrok implementation can use its redirect Traffic Policy. Providers without an edge redirect may expose HTTPS only rather than adding a port-80 tunnel upstream.
 
-While a shard's desired state is awake, its control-plane connectors advertise the production tunnel path. While asleep, a wake-capable shard leader advertises its local `nstance-proxy` connector. Reconciliation toward asleep waits for that connector before terminating control-plane VMs; reconciliation toward awake keeps it until a control-plane connector and the requested local upstream are ready. The external tunnel endpoint remains stable.
+While a shard's desired state is awake, its control-plane tunnel processes advertise the production path. While asleep, a wake-capable shard leader advertises a wake tunnel process targeting its local `nstance-proxy`. Reconciliation toward asleep waits for the wake tunnel process before terminating control-plane VMs; reconciliation toward awake keeps it until a production tunnel process and the requested local upstream are ready. The external tunnel endpoint remains stable.
 
-Nstance publishes generic connector state by logical load-balancer key, such as `/run/nstance/connectors/control-plane-tunnel.active`. vmconfig maps that key to its tunnel service. Nstance does not interpret tunnel-provider configuration.
+Nstance publishes generic tunnel-process desired state by logical load-balancer key, such as `/run/nstance/tunnels/control-plane-tunnel.active`. vmconfig maps that key to its tunnel service. Nstance does not interpret tunnel-provider configuration.
 
-Cloudflare replicas using one tunnel credential provide availability but no traffic steering. Therefore control-plane and `nstance-proxy` connectors may overlap only during transitions, when both paths can serve requests; the `nstance-proxy` connector must be withdrawn while the tenant is awake so normal traffic bypasses `nstance-proxy`.
+Cloudflare tunnel processes using one credential provide availability but no traffic steering. Therefore production and wake tunnel processes may overlap only during transitions, when both paths can serve requests; the wake tunnel process must be withdrawn while the tenant is awake so normal traffic bypasses `nstance-proxy`.
 
-The initial Cloudflare implementation uses public HTTPS applications, not Cloudflare's arbitrary-TCP client mode. Clients connect to Cloudflare's HTTPS edge on port 443 without `cloudflared`; Cloudflare terminates client TLS and sends HTTPS through the tunnel to kube-apiserver on local port 6443 or Traefik on local port 443. The `nst` connector sends the same HTTPS origin traffic to local `nstance-proxy`, which transparently forwards it to the selected production port after wake. Locally managed ingress rules allow the control-plane and `nst` connectors to use these different local targets despite sharing one tunnel credential.
+The initial Cloudflare implementation uses public HTTPS applications, not Cloudflare's arbitrary-TCP client mode. Clients connect to Cloudflare's HTTPS edge on port 443 without `cloudflared`; Cloudflare terminates client TLS and sends HTTPS through the tunnel to kube-apiserver on local port 6443 or Traefik on local port 443. The `nst` wake tunnel process sends the same HTTPS origin traffic to local `nstance-proxy`, which transparently forwards it to the selected production port after wake. Locally managed ingress rules allow the control-plane and `nst` tunnel processes to use these different local targets despite sharing one tunnel credential.
 
 Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and content. In tunnel mode, Podplane generates the kubeconfig API URL on external port 443 and relies on the operating system's public CA roots for the Cloudflare edge certificate instead of embedding the kube-apiserver CA. Cloudflare-to-origin connections remain TLS-protected. For the API route, vmconfig configures `cloudflared` with the Podplane cluster CA and API hostname. For ingress routes, it uses the configured ingress issuer CA or public roots and the ingress hostname. TLS verification must not be disabled.
 
@@ -204,7 +204,7 @@ Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and co
 
 Nstance's secret cache remains in-memory and per server process. Initial misses for one source are coalesced so local and agent delivery cause one provider read per cache lifetime. Secret values are not persisted in shared Nstance state. vmconfig-owned watchers install them with strict ownership and modes and restart only affected services; secrets must not appear in generated Terraform values, process arguments, logs, or world-readable files.
 
-Nstance writes only generic proxy, file, and connector-state data. vmconfig translates it into provider-specific service configuration, keeping Cloudflare- or ngrok-specific paths and commands out of Nstance.
+Nstance writes only generic proxy, file, and tunnel-process state. vmconfig translates it into provider-specific service configuration, keeping Cloudflare- or ngrok-specific paths and commands out of Nstance.
 
 ## Configuration
 
@@ -220,7 +220,7 @@ Scale-to-zero requires an exposure method capable of reaching `nstance-proxy`, u
 
 - **Podplane CLI:** exposure config, validation, generated Terraform, and endpoint outputs.
 - **Nstance Terraform modules:** port-aware AWS target groups and Google Cloud regional external passthrough NLBs, `GCE_VM_IP` NEGs, forwarding-rule metadata, firewall rules, and health checks.
-- **Nstance server:** proxy configuration, target/connector membership, cached local/agent file delivery, and ordered membership transitions.
+- **Nstance server:** proxy configuration, target membership, tunnel-process state, cached local/agent file delivery, and ordered transitions.
 - **vmconfig:** `knc`/`nst` tunnel services, optional `nstance-proxy`, local routing, and secret watchers.
 - **Components/Traefik:** retain control-plane host exposure on port 443 for tunnels and ports 80/443 for NLBs; no kube-apiserver proxying.
 
