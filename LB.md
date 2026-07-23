@@ -19,7 +19,7 @@ While Kubernetes is awake:
 
 Kube-apiserver must not depend on Traefik for ingress, because a broken ingress controller must not lock administrators out of the cluster.
 
-Nstance registers agent-healthy instances with AWS target groups or Google Cloud zonal NEGs and deregisters them before deletion. Registration is complete when the provider accepts it; the load balancer performs ongoing health checks. Transitions may have a brief outage while newly registered targets become healthy.
+Nstance registers agent-healthy instances with AWS target groups or Google Cloud zonal NEGs and deregisters them before deletion. Registration is ready for cutover only when the provider reports the target healthy and routable, not merely when it accepts the membership change. A bounded readiness timeout aborts the cutover and retains or restores the old path. The load balancer performs ongoing health checks after cutover.
 
 ## Scale-to-zero `nstance-proxy`
 
@@ -36,7 +36,7 @@ When a cluster goes to sleep, Nstance changes each configured proxy listener's e
 
 Proxy listeners are independent: a held request proceeds as soon as its configured group and target port are healthy.
 
-`WakeTenant` uses a shard-local durable compare-and-swap from desired `asleep` to `awake`, so concurrent `nstance-proxy` and timer triggers produce only one new local generation.
+`WakeTenant` uses a shard-local durable compare-and-swap to remove the tenant's sleep entry, so concurrent `nstance-proxy` and timer triggers deduplicate to the same awake state.
 
 ## Proxy configuration
 
@@ -139,7 +139,7 @@ Google Cloud forwarding-rule IPs are generated provider metadata, not addresses 
 
 Sleep transition:
 
-1. register the wake-capable shard leader's `nstance-proxy` target and wait for provider acceptance while production remains registered;
+1. register the wake-capable shard leader's `nstance-proxy` target and wait for it to become provider-health-check healthy and routable while production remains registered; if readiness times out, retain production routing and abort sleep;
 2. deregister the production targets with connection draining enabled while `nstance-proxy` remains registered and can forward to the existing upstream;
 3. once the provider confirms that production targets are draining and receive no new connections, wait for the next normal agent report and perform the final `if_not_busy` check described in [ZERO.md](./ZERO.md);
 4. if proxy payload arrived, a connection remains active, or a required report failed, restore production registration before deregistering `nstance-proxy` and aborting;
@@ -150,7 +150,7 @@ The final sleep decision and `WakeTenant` are serialized by the tenant transitio
 Wake transition:
 
 1. wake the tenant and wait for the requested upstream;
-2. register production targets and wait for provider acceptance while `nstance-proxy` remains registered;
+2. register production targets and wait for them to become provider-health-check healthy and routable while `nstance-proxy` remains registered; if readiness times out, retain the proxy path and continue reconciliation;
 3. during this overlap, either path may serve traffic;
 4. deregister `nstance-proxy` targets while allowing their active connections to drain.
 
@@ -158,7 +158,7 @@ On AWS, the cluster leader disables target-group cross-zone load balancing only 
 
 nstance-server performs target membership changes because it already owns instance lifecycle and limits cloud API access to one security boundary. IAM permissions must be scoped to the cluster's target groups and NEGs; Google Cloud additionally grants the NEG read permission required to resolve each configured NEG's subnet.
 
-The design must account for provider fail-open behaviour and must never intentionally leave both production and `nstance-proxy` registration sets empty during transition. `nstance-proxy` health checks must not invoke `WakeTenant`; payload activity on production ports remains the sleep guard described in [ZERO.md](./ZERO.md).
+The design must account for provider fail-open behaviour and must never intentionally leave both production and `nstance-proxy` registration sets empty or rely on fail-open traffic as evidence that a target is ready during transition. `nstance-proxy` health checks must not invoke `WakeTenant`; payload activity on production ports remains the sleep guard described in [ZERO.md](./ZERO.md).
 
 ## Nstance Server VM
 
@@ -224,4 +224,4 @@ Scale-to-zero requires an exposure method capable of reaching `nstance-proxy`, u
 - **vmconfig:** `knc`/`nst` tunnel services, optional `nstance-proxy`, local routing, and secret watchers.
 - **Components/Traefik:** retain control-plane host exposure on port 443 for tunnels and ports 80/443 for NLBs; no kube-apiserver proxying.
 
-Tests must cover shared and separate listener groups, same-tenant shared and cross-tenant rejected load balancers, AWS regional target groups shared across shards and Availability Zones, proxy-port uniqueness, cross-zone enable-before-sleep and disable-after-wake ordering, cluster-leader replacement during each transition, Google Cloud forwarding-rule-address dispatch and equal-port validation, derived proxy-file generation, initial secret-miss coalescing, Google Cloud `GCE_VM_IP` NEG metadata resolution and subnet selection, shared same-zone NEG membership, public-HTTPS tunnel kubeconfig and origin verification, one and multiple wake-capable shards, zero-sized group exclusion, partial upstream health, shard-leader replacement, bounded connection holding, direct kube-apiserver access, and sleep/wake transitions without empty registration sets.
+Tests must cover shared and separate listener groups, same-tenant shared and cross-tenant rejected load balancers, AWS regional target groups shared across shards and Availability Zones, proxy-port uniqueness, cross-zone enable-before-sleep and disable-after-wake ordering, cluster-leader replacement during each transition, Google Cloud forwarding-rule-address dispatch and equal-port validation, derived proxy-file generation, initial secret-miss coalescing, Google Cloud `GCE_VM_IP` NEG metadata resolution and subnet selection, shared same-zone NEG membership, public-HTTPS tunnel kubeconfig and origin verification, one and multiple wake-capable shards, zero-sized group exclusion, partial upstream health, provider-health readiness timeouts and rollback, AWS fail-open without treating an unhealthy target as ready, shard-leader replacement, bounded connection holding, direct kube-apiserver access, and sleep/wake transitions without empty registration sets.
