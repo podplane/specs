@@ -65,7 +65,7 @@ Google Cloud configuration lists its zonal `GCE_VM_IP` NEGs and passthrough fron
 ```jsonc
 "load_balancers": {
   "control-plane": {
-    "provider": "gcp",
+    "provider": "google",
     "network_endpoint_groups": [
       "control-plane-us-central1-a",
       "control-plane-nstance-us-central1-a"

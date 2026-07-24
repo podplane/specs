@@ -19,6 +19,7 @@
   - AWS target-group entries with ARN, listener port, target port, and proxy port.
   - Google Cloud `GCE_VM_IP` NEG names plus forwarding-rule IP/port metadata.
   - Provider-neutral tunnel listeners with target and proxy ports.
+- Use `google` as the Google Cloud infrastructure and load-balancer provider literal and `google-secret-manager` as its Secret Manager provider literal. The former `gcp` and `gcp-secret-manager` literals are unsupported in 2.0.0.
 - Add the top-level tenant `nat` map from NAT.md and validate:
   - at most one dedicated NAT group per tenant;
   - at least one of dedicated or small-cluster NAT when the tenant entry exists;
@@ -29,6 +30,7 @@
 - Extend the operator gRPC service with idempotent `SleepTenant` and `WakeTenant` operations and status needed for all-shard compensation. Make `if_not_busy`, optional `wake_at`, listener-scoped wake, and already-awake/asleep results explicit.
 - Have nstance-operator read bootstrap trust from a Kubernetes ConfigMap and the one-time registration nonce from a dedicated Secret in the cluster-specific Netsy seed.
 - Treat the registration signing-key storage format and nonce claims/signature as a tested cross-repository bootstrap contract. Keep Nstance's lazy create-if-absent key generation for non-Podplane deployments; the Podplane Terraform provider may create or read the same key without importing Nstance's `internal` packages.
+- Keep that bootstrap integration secrets-backend-aware: AWS defaults to `aws-parameter-store` for direct secret storage and as the object-storage encryption-key provider, while Google Cloud defaults to `google-secret-manager`. Do not assume that an AWS cluster uses Secrets Manager.
 - Make operator registration retry-safe for the same persisted public key and nonce so a lost response cannot consume the nonce without allowing the operator to recover its certificate.
 - After durably storing and verifying its operator certificate, have nstance-operator delete only the nonce bootstrap Secret. It must not delete the CA configuration or its managed key/certificate Secret.
 - Extend agent health reports with:
