@@ -32,8 +32,8 @@ A tenant's `sleep` entry means asleep; its absence means awake. `wake_at` is omi
 
 Nstance adds idempotent operations:
 
-- `SleepTenant`: add or update the tenant's `sleep` entry in the receiving server's shard, with optional `wake_at` and guarded `if_not_busy` behavior;
-- `WakeTenant`: remove the tenant's `sleep` entry in that shard and remove the tenant key if it has no other dynamic state.
+- `SleepTenant`: its request carries `tenant`, `if_not_busy`, and optional `wake_at`; its response returns `SLEPT`, `ALREADY_ASLEEP`, or `BUSY`, the current `AWAKE` or `ASLEEP` status, and the effective optional `wake_at`;
+- `WakeTenant`: its request carries `tenant` and an optional listener identity; its response returns `WOKE` or `ALREADY_AWAKE`, the current status, and an optional ready upstream. A listener-scoped wake waits for and returns an upstream, while an unscoped compensation wake does not require one.
 
 This includes the tenant's configured NAT group in that shard. On wake, normal reconciliation restores desired sizes; NAT dependencies ensure required NAT instances become healthy before nodes launch. `nstance-proxy` uses configured listener-to-group mappings and needs no previous-size knowledge.
 
@@ -96,20 +96,22 @@ nstance-agent validates the pinned links, opens `maps/active_connections` read-o
 
 ```jsonc
 {
-  "ebpf_counters": {
-    "443": 0,
-    "6443": 0
+  "metrics": {
+    "ebpf_counters": {
+      "443": 0,
+      "6443": 0
+    }
   }
 }
 ```
 
-If link validation or a configured map read fails, the report includes `ebpf_error`; otherwise the error is omitted. If the environment variable is unset, or a valid map has no entries, no counters are reported. For an instance in a group referenced by a proxy listener, an error or missing expected port blocks normal sleep; Nstance derives those ports from the listener configuration. Other instances need no counters.
+If link validation or a configured map read fails, the report includes `metrics.ebpf_error`; otherwise the error is omitted. If the environment variable is unset, or a valid map has no entries, no counters are reported. For an instance in a group referenced by a proxy listener, an error or missing expected port blocks normal sleep; Nstance derives those ports from the listener configuration. Other instances need no counters.
 
 ### Final sleep guard
 
 Periodic agent reports provide the initial inactivity signal. For the final guard, `SleepTenant(if_not_busy=true)` establishes the proxy path and starts the provider-specific production-target withdrawal described in [LB.md](./LB.md). Once the provider confirms that production targets are draining and receive no new connections, Nstance waits for a subsequent normal health report from each remaining relevant agent.
 
-Nstance refuses sleep if a required report is missing, contains `ebpf_error`, reports a nonzero active count, or if proxy payload arrives during the transition. On refusal, Nstance restores production routing before withdrawing the proxy path. Otherwise it waits for production targets to finish deregistering, commits the tenant's sleep entry, and begins instance termination. Forced sleep bypasses this guard. Reports never include client addresses or connection tuples.
+Nstance refuses sleep if a required report is missing, contains `metrics.ebpf_error`, reports a nonzero active count, or if proxy payload arrives during the transition. On refusal, Nstance restores production routing before withdrawing the proxy path. Otherwise it waits for production targets to finish deregistering, commits the tenant's sleep entry, and begins instance termination. Forced sleep bypasses this guard. Reports never include client addresses or connection tuples.
 
 ## CronJob wake deadlines
 
@@ -143,7 +145,7 @@ Podplane supports scale-to-zero only for AWS and Google Cloud clusters using the
 
 For supported clusters, Terraform conditionally creates or adopts Nstance's registration signing key, then the cluster-specific Netsy seed creation operation reads that key in memory, mints a tenant- and cluster-scoped single-use nonce with a 30-minute TTL, and inserts the nonce as a dedicated Kubernetes Secret. It reads the signing key only when creating the seed; refresh and completed-seed adoption use non-secret metadata. The public CA is seeded separately as a ConfigMap. Neither the signing key nor nonce appears in generic seeds, Terraform schema values/state/output, logs, diagnostics, command arguments, or temporary files.
 
-nstance-operator deletes the nonce Secret only after durably storing and verifying its key and certificate. Registration is idempotent for the same operator key after a lost response. An expired nonce on a live, unregistered cluster is replaced manually using the Nstance admin nonce command and `kubectl`; a cluster that never becomes live is destroyed and recreated. Initial seeds are never re-uploaded over live Netsy state.
+nstance-operator deletes the nonce Secret only after durably storing and verifying its key and certificate. Registration is retry-safe after a lost response for the exact nonce JWT and byte-identical operator public-key PEM; a different PEM is rejected. An expired nonce on a live, unregistered cluster is replaced manually using the Nstance admin nonce command and `kubectl`; a cluster that never becomes live is destroyed and recreated. Initial seeds are never re-uploaded over live Netsy state.
 
 ## CLI
 

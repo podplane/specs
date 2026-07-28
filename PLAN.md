@@ -15,29 +15,35 @@
 8. Run provider end-to-end tests with forced sleep before enabling automatic sleep.
 ## Repository: `nstance-dev/nstance`
 ### Phase 1: Freeze shared configuration and API contracts
-- Replace the current coarse load-balancer configuration with the provider-specific `load_balancers` shapes from LB.md:
-  - AWS target-group entries with ARN, listener port, target port, and proxy port.
-  - Google Cloud `GCE_VM_IP` NEG names plus forwarding-rule IP/port metadata.
-  - Provider-neutral tunnel listeners with target and proxy ports.
-- Use `google` as the Google Cloud infrastructure and load-balancer provider literal and `google-secret-manager` as its Secret Manager provider literal. The former `gcp` and `gcp-secret-manager` literals are unsupported in 2.0.0.
-- Add the top-level tenant `nat` map from NAT.md and validate:
-  - at most one dedicated NAT group per tenant;
-  - at least one of dedicated or small-cluster NAT when the tenant entry exists;
-  - no fixed `size` on a derived NAT group;
-  - initial-subnet reservation and cross-tenant subnet exclusivity;
-  - identity-pool, grace-period, vertical-scaling, and threshold settings.
-- Define shared proxy structs in a public/internal-neutral package used by both `nstance-server` and the new `nstance-proxy` binary. Include only static listener identity, tenant, groups, target port, proxy port, and optional destination IP.
-- Extend the operator gRPC service with idempotent `SleepTenant` and `WakeTenant` operations and status needed for all-shard compensation. Make `if_not_busy`, optional `wake_at`, listener-scoped wake, and already-awake/asleep results explicit.
-- Have nstance-operator read bootstrap trust from a Kubernetes ConfigMap and the one-time registration nonce from a dedicated Secret in the cluster-specific Netsy seed.
-- Treat the registration signing-key storage format and nonce claims/signature as a tested cross-repository bootstrap contract. Keep Nstance's lazy create-if-absent key generation for non-Podplane deployments; the Podplane Terraform provider may create or read the same key without importing Nstance's `internal` packages.
-- Keep that bootstrap integration secrets-backend-aware: AWS defaults to `aws-parameter-store` for direct secret storage and as the object-storage encryption-key provider, while Google Cloud defaults to `google-secret-manager`. Do not assume that an AWS cluster uses Secrets Manager.
-- Make operator registration retry-safe for the same persisted public key and nonce so a lost response cannot consume the nonce without allowing the operator to recover its certificate.
-- After durably storing and verifying its operator certificate, have nstance-operator delete only the nonce bootstrap Secret. It must not delete the CA configuration or its managed key/certificate Secret.
-- Extend agent health reports with:
-  - `ebpf_counters` keyed by port and `ebpf_error`;
-  - NAT throughput, packet rate, conntrack count/limit, CPU, and packet-drop metrics;
-  - forwarding readiness needed before route cutover.
-- Regenerate protobuf code and update server, agent, operator, and tests atomically for the 2.0.0 contract; do not retain legacy fields or decoders solely for 1.x clients/configuration.
+- [x] Replace the current coarse load-balancer configuration with the provider-specific `load_balancers` shapes from LB.md:
+  - [x] AWS target-group entries with ARN, listener port, target port, and proxy port.
+  - [x] Google Cloud `GCE_VM_IP` NEG names plus forwarding-rule IP/port metadata.
+  - [x] Provider-neutral tunnel listeners with target and proxy ports.
+- [x] Use `google` as the Google Cloud infrastructure and load-balancer provider literal and `google-secret-manager` as its Secret Manager provider literal. The former `gcp` and `gcp-secret-manager` literals are unsupported in 2.0.0.
+- [x] Add the top-level tenant `nat` map from NAT.md and validate:
+  - [x] at most one dedicated NAT group per tenant;
+  - [x] at least one of dedicated or small-cluster NAT when the tenant entry exists;
+  - [x] no fixed `size` on a derived NAT group;
+  - [x] initial-subnet reservation and cross-tenant subnet exclusivity;
+  - [x] tenant-owned `network_identity_pool`, `last_node_grace_period`, ordered `instance_type_ladder`, thresholds, scaling windows, cooldown, and replacement timeout.
+- [x] Define shared `pkg/proxy` structs used by both `nstance-server` and the new `nstance-proxy` binary. Represent static listener identity as the map key; include only tenant, groups, target port, proxy port, and optional destination IP in each value.
+- [x] Extend the operator gRPC contract with idempotent `SleepTenant` and `WakeTenant` result/status semantics needed for all-shard compensation. Make `if_not_busy`, optional `wake_at`, optional listener-scoped wake, optional ready upstream, and already-awake/asleep results explicit.
+- [x] Have nstance-operator read bootstrap trust from a Kubernetes ConfigMap and the one-time registration nonce from a dedicated Secret in the cluster-specific Netsy seed.
+- [x] Define and test the cross-repository registration nonce claims/signature contract in public `pkg/nonce`, and retain the PKCS#8 PEM Ed25519 signing-key storage contract. Keep Nstance's lazy create-if-absent key generation for non-Podplane deployments; the Podplane Terraform provider may create or read the same key without importing Nstance's `internal` packages.
+- [x] Keep that bootstrap integration secrets-backend-aware: AWS defaults to `aws-parameter-store` for direct secret storage and as the object-storage encryption-key provider, while Google Cloud defaults to `google-secret-manager`. Do not assume that an AWS cluster uses Secrets Manager.
+- [x] Make operator registration retry-safe by durably and atomically binding the exact nonce JWT to its byte-identical public-key PEM on first use. Accept that pair after a lost response and reject a different PEM, including across leader replacement.
+- [x] After durably storing and verifying its operator certificate, have nstance-operator delete only the nonce bootstrap Secret. It must not delete the CA configuration or its managed key/certificate Secret.
+- [x] Replace agent-side metric history with one `metrics` observation per health report; `NSTANCE_REPORT_INTERVAL` controls report transmission and metric collection occurs while constructing each report.
+- [x] Extend the agent health-report contract with:
+  - [x] current CPU, per-core CPU, and memory utilization;
+  - [x] optional `network_interface` cumulative byte, packet, and drop counters selected by `NSTANCE_METRICS_INTERFACE`, plus `network_interface_error`;
+  - [x] conntrack count/limit and explicit collection errors when interface metrics are enabled;
+  - [x] `ebpf_counters` keyed by port and `ebpf_error`;
+  - [x] raw cumulative network-interface counters suitable for server-side rate and window derivation.
+- [x] Define NAT-instance readiness as agent registration followed by a successful health report; do not add a separate forwarding-readiness metric.
+- [x] Normalize every protobuf enum to a prefixed zero-valued `UNSPECIFIED` member and consistently prefixed operational values.
+- [x] Move the Go puidv7 dependency to `github.com/puidv7/puidv7-go`.
+- [x] Regenerate protobuf code and update server, agent, operator, and tests atomically for the 2.0.0 contract; do not retain legacy fields or decoders solely for 1.x clients/configuration.
 **Exit gate:** configuration validation rejects every invalid collision/topology listed in the three specs, and all Nstance consumers use the new generated protobuf and configuration contracts.
 ### Phase 2: Add durable tenant sleep state and transition serialization
 - Add `shard/<shard>/tenants.jsonc` storage models and ETag/generation compare-and-swap helpers.
@@ -53,7 +59,7 @@
 - Keep tenant state shard-local. Add only the AWS cross-zone disable barrier to cluster-leader coordination.
 **Exit gate:** storage tests cover CAS conflicts, restart/failover, simultaneous wake triggers, sleep updates, and removal of empty tenant keys; reconciliation tests prove desired sizes survive sleep.
 ### Phase 3: Implement listener derivation and `nstance-proxy`
-- Derive listener-to-tenant/group mappings at config load and reload time. Reject cross-tenant references, zero-sized wake targets, invalid ports, provider-specific collisions, and server-port collisions.
+- Derive the static `listeners` map at config load and reload time, with listener identity represented only by the map key. Use `<load-balancer-key>:<proxy-port>` for AWS and tunnel listeners; for Google Cloud, use `<load-balancer-key>:<port>` when the port is unique or `<load-balancer-key>/<destination-ip>:<port>` when a shared port requires destination-IP dispatch. Reject cross-tenant references, zero-sized wake targets, invalid ports, duplicate Google Cloud destination-IP/port selectors, proxy-port collisions, and server-port collisions.
 - Atomically write `/run/nstance/nstance-proxy.json` with root ownership and proxy-readable permissions. Rewrite it only for static config changes, not membership changes.
 - Add the `nstance-proxy` binary:
   - bind configured ports and dispatch Google Cloud shared ports by accepted destination IP;
@@ -108,14 +114,14 @@
   - AWS subnet route-table default route to the selected forwarding ENI;
   - Google Cloud subnet-specific node tags and tagged default routes to a forwarding VM;
   - mutate a route only while Podplane Managed NAT is configured, the resource is scoped to this cluster, and its current next hop is still Podplane-managed, so stale reconciliation cannot overwrite Terraform's Cloud Managed NAT cutover.
-- Enforce node creation ordering: select subnet, establish healthy NAT, install route, then create the node.
+- Enforce node creation ordering: select the subnet, wait for its NAT agent to register and submit a successful health report, install and verify the route, then create the node. Do not require a separate forwarding-readiness metric.
 - Implement small-cluster NAT on the elected shard leader, including activation-before-route-switch and leadership failover.
 - Implement last-node grace handling, NAT-first wake, node-first sleep, and cleanup when changing back to Cloud Managed NAT.
 - Implement both mode transitions explicitly:
   - Cloud Managed to Podplane Managed: disable Cloud Managed NAT/update Nstance configuration, retain provider and object-storage reachability, then let Nstance establish healthy next hops and install Podplane Managed routes; document the temporary general IPv4 egress outage.
   - Podplane Managed to Cloud Managed: create and validate Cloud Managed NAT, switch node-subnet routing, then let Nstance disable small-cluster forwarding, terminate dedicated NAT instances, and release identities.
 - Keep IPv6 untranslated and preserve existing IPv6 routing through both mode changes.
-- Implement vertical A/B replacement for dedicated NAT instances using health, ordered instance-type ladders, and a second stable identity. Scale up when any threshold remains exceeded for the configured two-to-five-minute window; scale down only when all metrics remain below their thresholds for the configured 20-to-30-minute window; enforce the configurable ten-minute cooldown. Never do disruptive same-identity replacement on pool exhaustion.
+- Implement vertical A/B replacement for dedicated NAT instances using readiness defined as agent registration plus a successful health report, the tenant-owned ordered `instance_type_ladder`, and a second stable identity. On nstance-server, derive throughput, packet, and drop rates from consecutive timestamped reports containing raw cumulative interface counters, and evaluate the tenant-owned thresholds and windows there. Scale up when any threshold remains exceeded for the configured two-to-five-minute window; scale down only when all metrics remain at or below their thresholds for the configured 20-to-30-minute window; enforce the configurable cooldown. Never perform disruptive same-identity replacement on pool exhaustion.
 - When identities are exhausted, prefer already-populated subnets with remaining capacity before blocking node scale-up.
 **Exit gate:** tests cover placement capacity, concurrent creates, current-next-hop route ownership, tenant conflicts, leader changes, both ordered mode transitions, retained provider/object-storage access, unchanged IPv6 routing, mixed metric windows, alternate-subnet placement under identity exhaustion, vertical replacement/cooldown, NAT-first wake, and node-first sleep on both providers.
 ### Phase 6: Implement Kubernetes sleep policy in `nstance-operator`
@@ -150,7 +156,7 @@
   - `can_ip_forward`, external IPv4 for `nst` in Podplane Managed mode, Private Google Access, and scoped NEG/route permissions;
   - firewall rules that expose only configured load-balancer health/proxy paths while keeping every nstance-server API private.
 - Pass only static resource identity/configuration to nstance-server; do not put dynamic target membership in Terraform state.
-- Add `nst` vmconfig userdata inputs, optional proxy/tunnel settings, shard endpoints, and NAT identity-pool references. Do not place an operator nonce in VM userdata, Terraform outputs, or state.
+- Add `nst` vmconfig userdata inputs for optional proxy/tunnel settings and shard endpoints, and pass tenant-owned NAT `network_identity_pool` references through the generated Nstance configuration. Do not place an operator nonce in VM userdata, Terraform outputs, or state.
 - Update examples and module contract tests for Cloud Managed NAT, Podplane Managed NAT, NLBs, tunnels, and mode changes that preserve node subnets.
 **Exit gate:** `tofu validate` and provider-specific fixture plans pass; plans show no node-subnet replacement when switching NAT modes, no duplicated AWS target groups or same-zone Google NEGs, and no public path to nstance-server APIs. Network tests prove public traffic can reach configured proxy/health listeners but cannot invoke `WakeTenant`, which remains Unix-socket-only.
 ### Phase 8: Publish Nstance 2.0.0
@@ -193,10 +199,10 @@
 **Exit gate:** local VM tests prove tunnel state switches between production and wake paths, secret rotation restarts only the affected tunnel service, and both API and ingress origins retain TLS verification.
 ### Phase 4: Implement NAT host behavior
 - In the `nst` overlay, configure optional IP forwarding and source NAT for small-cluster NAT while leaving it inactive on non-leaders.
-- Independently in the `nat` overlay, configure forwarding, source NAT, conntrack limits, Nstance agent reporting, packet-drop/throughput/packet-rate/CPU metrics, and readiness checks.
+- Independently in the `nat` overlay, configure forwarding, source NAT, conntrack limits, and Nstance agent reporting of current CPU and memory, conntrack count and limit, and raw cumulative byte, packet, and drop counters for `NSTANCE_METRICS_INTERFACE`, including explicit collection errors. Do not calculate rates or windows in vmconfig or report a separate forwarding-readiness metric.
 - Ensure AWS source/destination-check and Google `can_ip_forward` remain Terraform/provider concerns, not shell-script cloud API calls.
 - Make forwarding activation/deactivation idempotent and safe across reboot and Nstance leadership transitions.
-**Exit gate:** network-namespace or VM integration tests verify forwarding, SNAT, readiness, metrics, and deactivation for `nst` and `nat`.
+**Exit gate:** network-namespace or VM integration tests verify forwarding, SNAT, idempotent deactivation, raw cumulative interface counters, conntrack and current-utilization reporting, and explicit collection errors for `nst` and `nat`; Nstance integration tests verify readiness from registration plus a successful health report, without a forwarding-readiness metric.
 ### Phase 5: Publish manifests
 - Publish all new kind/architecture packages and manifests.
 - Pin the Nstance 2.0.0 release in each new manifest.
@@ -238,8 +244,8 @@
 ### Phase 1: Add user-facing configuration and schemas
 - Replace the current provider-only load-balancer projection with an exposure model that independently selects NLB, tunnel, or custom behavior for Kubernetes API and ingress.
 - Add provider-specific NLB settings and provider-neutral tunnel settings while keeping application domain configuration separate.
-- Add NAT mode (`cloud-managed` or `podplane-managed`), maximum dedicated NAT identities per zone, small-cluster NAT settings, NAT group template/scaling policy, and stable identity-pool settings.
-- Add disabled-by-default sleep policy with activity windows, CronJob look-ahead, wake lead, proxy timeout, and readiness timeout.
+- Add NAT mode (`cloud-managed` or `podplane-managed`), maximum dedicated NAT identities per zone, and tenant-owned `nat` settings: `network_identity_pool`, `last_node_grace_period`, ordered `instance_type_ladder`, thresholds and windows, cooldown, replacement timeout, and small-cluster NAT. Keep only the deployment template and starting `instance_type` on the referenced NAT group.
+- Add disabled-by-default sleep policy with activity windows, CronJob look-ahead, wake lead, proxy connection-hold timeout, and provider cutover/upstream readiness timeout.
 - Validate:
   - scale-to-zero requires an AWS or Google Cloud cluster using the `recommended` seed;
   - indefinitely sleeping configurations have either a proxy-reachable exposure method or a guaranteed `wake_at` policy;
@@ -252,8 +258,8 @@
 ### Phase 2: Generate infrastructure and Nstance/vmconfig inputs
 - Generalize Terraform generation to AWS and Google Cloud module sources with equivalent topology inputs.
 - Emit Cloud Managed versus Podplane Managed NAT resources without changing node-subnet identity.
-- Generate one `/26` per node placement subnet and the Nstance `nat` configuration, dedicated NAT template, identity pool, and `nat` vmconfig manifest references.
-- Generate provider-specific load-balancer metadata in the new Nstance config shape, including all production and Nstance-server subnets required for Google NEGs.
+- Generate one `/26` per node placement subnet and the top-level tenant-keyed Nstance `nat` configuration, including the dedicated group reference, tenant-owned `network_identity_pool`, `last_node_grace_period`, ordered `instance_type_ladder`, thresholds and windows, cooldown, replacement timeout, and small-cluster settings. Generate the referenced group's deployment template and starting `instance_type`, plus the `nat` vmconfig manifest references.
+- Generate provider-specific load-balancer metadata in the frozen Nstance configuration shape, including all production and Nstance-server subnets required for Google NEGs. Preserve each Google forwarding-rule destination IP and its single equal frontend, proxy, and target port so Nstance can derive the finalized static listener map keys and destination-IP dispatch selectors.
 - Select and pin `knc`, `knd`, `nst`, and `nat` vmconfig manifests by architecture, and pass immutable install features to each userdata data source. Set the Cloudflare tunnel feature only for affected `knc`/`nst` VMs and traffic accounting only for affected `knc`/`knd` groups participating in guarded normal sleep.
 - Replace generic Nstance-server userdata with the `nst` vmconfig kind and pass optional proxy/tunnel configuration through generated environment/files.
 - Generate tunnel resources and secret delivery for Cloudflare without serializing credentials into normal Terraform values, process arguments, logs, or world-readable files.
@@ -316,12 +322,12 @@
 ### Phase 2: Add state-safe Nstance operator seed bootstrap
 - Add a state-safe signing-key resource that conditionally creates Nstance's registration key in its encrypted secrets store or adopts the existing key after an interrupted apply/Nstance lazy initialization. State contains only backend identity, version, and hash; updates never rotate the key automatically.
 - Make the existing Netsy seed resource depend on the signing-key resource and boundedly wait for Nstance's public `ca.crt`.
-- In the seed resource's Create operation only, read/decrypt the signing key into memory, mint the 30-minute tenant- and cluster-scoped single-use nonce using the provider's implementation of the tested Nstance bootstrap contract, inject the nonce Secret and CA ConfigMap, and upload the completed cluster-specific seed without intermediate plaintext files.
+- In the seed resource's Create operation only, read and decrypt the signing key into memory and use Nstance's public `pkg/nonce` contract to mint the 30-minute tenant- and cluster-scoped nonce JWT. Inject the nonce Secret and CA ConfigMap and upload the completed cluster-specific seed without intermediate plaintext files.
 - Before reading the key, detect and adopt an already-completed seed; normal Read/refresh inspects only non-secret metadata. This recovers both a write-before-state signing-key interruption and an upload-before-state seed interruption.
 - Keep the signing key and nonce out of schema values, plans, state, outputs, command arguments, diagnostics, logs, and temporary files; discard in-memory plaintext after Create.
-- Make retries idempotent using Nstance's durable operator registration record and the persisted operator public key: tolerate delayed bootstrap, apply interruption, a lost registration response, and leader replacement.
+- Rely on Nstance's durable, atomic binding of the exact nonce JWT to the byte-identical operator public-key PEM: retrying that exact pair after a lost response succeeds, while any different JWT or PEM is rejected, including after leader replacement. Provider create/adopt behavior must tolerate delayed bootstrap and apply interruption without attempting to recreate that registration record.
 - Do not add automatic initialized-cluster repair to the Terraform provider. Document the simple recovery contract: use the canonical Nstance admin nonce command and `kubectl` to replace the bootstrap Secret when the cluster is live; destroy and recreate a cluster that never became live. Never re-upload an initial seed over live Netsy state.
-**Exit gate:** provider integration tests cover key create/adopt races, seed create/adopt paths, proof that key reads occur only when seed creation is required, the 30-minute nonce TTL, delayed CA bootstrap, nonce use, lost registration responses, apply interruption, leader change, and the shared Nstance 2.0 bootstrap format. Tests permit the nonce only inside the encrypted cluster-specific seed; live-cluster expiry recovery remains a documented manual procedure and cluster test.
+**Exit gate:** provider integration tests cover key create/adopt races, seed create/adopt paths, proof that key reads occur only when seed creation is required, the 30-minute nonce TTL, delayed CA bootstrap, use of public `pkg/nonce`, apply interruption, and leader change. Registration tests prove that the exact JWT plus byte-identical public-key PEM succeeds after a lost response and that a different JWT or PEM is rejected. Tests permit the nonce only inside the encrypted cluster-specific seed; live-cluster expiry recovery remains a documented manual procedure and cluster test.
 ## Repository: `podplane/seedgen`
 seedgen turns a running reference cluster into audited, provider-neutral minimal and recommended Netsy snapshots. Provider-required component enablement is applied later by Podplane while it builds the cluster-specific snapshot; seedgen does not own that selection logic.
 ### Phase 1: Confirm provider-neutral filtering

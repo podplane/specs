@@ -105,8 +105,6 @@ At startup and configuration reload, nstance-server derives static runtime confi
   "listeners": {
     "control-plane:6443": {
       "proxy_port": 6443,
-      // Google Cloud only when this port is shared:
-      "destination_ip": "34.10.20.30",
       "tenant": "default",
       "groups": ["control-plane"],
       "target_port": 6443
@@ -115,13 +113,38 @@ At startup and configuration reload, nstance-server derives static runtime confi
 }
 ```
 
-`destination_ip` is present only when required to disambiguate Google Cloud frontends sharing a port. The file contains no provider resources or dynamic upstream addresses. AWS instead uses the configured `proxy_port` as the target-registration port override; Google Cloud requires frontend, proxy, and target ports to match.
+Listener identity is the key in the `listeners` map and is not duplicated in the listener value. AWS and tunnel identities use `<load-balancer-key>:<proxy-port>`. A Google listener uses `<load-balancer-key>:<port>` when its port is unique across configured Google frontends. When the port is shared, its identity uses `<load-balancer-key>/<destination-ip>:<port>` and `destination_ip` is included in the listener value. Standard host-and-port formatting keeps IPv6 identities unambiguous.
 
-Both processes use structs from a shared Nstance proxy package. Nstance-server atomically writes `/run/nstance/nstance-proxy.json` with root ownership and proxy-readable permissions; `nstance-proxy` waits for it at startup and reloads after replacement. The file is not rewritten for instance membership changes.
+For example, two Google Cloud frontends sharing port 443 require destination-IP dispatch:
+
+```jsonc
+{
+  "listeners": {
+    "control-plane/34.10.20.30:443": {
+      "proxy_port": 443,
+      "destination_ip": "34.10.20.30",
+      "tenant": "default",
+      "groups": ["control-plane"],
+      "target_port": 443
+    },
+    "ingress/34.10.20.31:443": {
+      "proxy_port": 443,
+      "destination_ip": "34.10.20.31",
+      "tenant": "default",
+      "groups": ["ingress"],
+      "target_port": 443
+    }
+  }
+}
+```
+
+The file contains no provider resources or dynamic upstream addresses. AWS uses the configured `proxy_port` as the target-registration port override. A Google frontend's single `port` supplies its frontend, proxy, and target ports; duplicate destination-IP and port selectors are rejected.
+
+Both processes use the shared `pkg/proxy` configuration structs. Each listener value contains only `tenant`, `groups`, `target_port`, `proxy_port`, and optional `destination_ip`. Nstance-server atomically writes `/run/nstance/nstance-proxy.json` with root ownership and proxy-readable permissions; `nstance-proxy` waits for it at startup and reloads after replacement. The file is not rewritten for instance membership changes.
 
 `WakeTenant(listener)` validates the listener, idempotently wakes its tenant, waits for an agent-healthy instance from any configured group and for `target_port` readiness, then returns one private `IP:target_port`. This remains the only nstance-proxy-to-server operation. `nstance-proxy` understands no provider APIs, Kubernetes, kube-apiserver, or Traefik.
 
-Every derived listener is a wake trigger and activity source. Validation rejects cross-tenant references, invalid ports, AWS and tunnel proxy-port collisions, Google Cloud frontend collisions, unequal Google passthrough ports, and collisions with nstance-server ports.
+Every derived listener is a wake trigger and activity source. Validation rejects cross-tenant references, invalid ports, duplicate Google Cloud destination-IP and port selectors, collisions with nstance-server ports, and any reuse of an AWS or tunnel proxy port, including by a Google listener.
 
 ## Network Load Balancers
 

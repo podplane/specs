@@ -46,13 +46,35 @@ Each shard's Nstance configuration identifies at most one NAT group per tenant t
 "groups": {
   "default": {
     "nat": {
-      // NAT template and configuration
+      "template": "nat",
+      "instance_type": "t4g.small"
     }
   }
 },
 "nat": {
   "default": {
     "group": "nat",
+    "network_identity_pool": "default-nat-identities",
+    "last_node_grace_period": "10m",
+    "instance_type_ladder": ["t4g.small", "t4g.medium", "t4g.large"],
+    "scale_up_thresholds": {
+      "throughput_percent": 80,
+      "packets_per_second_percent": 80,
+      "conntrack_percent": 80,
+      "cpu_percent": 80,
+      "packet_drops_per_second": 1
+    },
+    "scale_down_thresholds": {
+      "throughput_percent": 30,
+      "packets_per_second_percent": 30,
+      "conntrack_percent": 30,
+      "cpu_percent": 30,
+      "packet_drops_per_second": 0
+    },
+    "scale_up_window": "3m",
+    "scale_down_window": "25m",
+    "cooldown": "10m",
+    "replacement_timeout": "10m",
     "small_cluster": {
       "initial_subnet": "nodes-0",
       "max_instances": 10
@@ -61,7 +83,11 @@ Each shard's Nstance configuration identifies at most one NAT group per tenant t
 }
 ```
 
-The map key is the tenant. Optional `group` references the dedicated NAT group under `groups[tenant]`; `small_cluster` configures small-cluster NAT. A missing tenant entry disables Podplane Managed NAT for that tenant. At least one mechanism must be configured, and invalid references are configuration errors. The singular `group` reference makes multiple dedicated NAT groups for one tenant unrepresentable. Tenant-level options such as last-node grace period and identity-pool reference belong in this object; template, starting instance type, and vertical-scaling policy remain on the referenced group.
+The map key is the tenant. Optional `group` references the dedicated NAT group under `groups[tenant]`; `small_cluster` configures small-cluster NAT. A missing tenant entry disables Podplane Managed NAT for that tenant. At least one mechanism must be configured, and invalid references are configuration errors. The singular `group` reference makes multiple dedicated NAT groups for one tenant unrepresentable.
+
+`nat.<tenant>` owns `network_identity_pool`, `last_node_grace_period`, `instance_type_ladder`, scale-up and scale-down thresholds and windows, `cooldown`, and `replacement_timeout`. The referenced group owns only deployment settings such as its template and starting `instance_type`. The ladder is ordered from lowest to highest capacity and must contain that starting instance type. `network_identity_pool` names the provider-neutral stable network identities available to dedicated NAT replacements: ENIs and their addresses on AWS, or reserved internal and external addresses on Google Cloud.
+
+`last_node_grace_period` defaults to ten minutes and must be positive. A dedicated group requires `network_identity_pool`, and the pool cannot be specified without a dedicated group. Its ladder must be nonempty and cannot contain empty or duplicate instance types. Omitted threshold objects receive their complete defaults; a supplied object must specify valid values for every threshold. Utilization percentages must be greater than zero and no more than 100, with each scale-down threshold below its scale-up threshold. Packet-drop thresholds must be non-negative, with the scale-down threshold below the scale-up threshold.
 
 When configured, the referenced group has one derived instance per populated tenant node subnet not served by small-cluster NAT, rather than a fixed desired count. It is excluded from MachinePool import and replica distribution. Each derived member stores its subnet, instance type, route state, and lifecycle. Group `size` is rejected; `instance_type` is the starting/default size for each derived member.
 
@@ -93,8 +119,11 @@ The kind configures:
 - IP forwarding and source NAT;
 - Nstance agent health/config reporting;
 - conntrack limits and metrics;
-- packet-drop, throughput, packet-rate, and CPU metrics;
+- current CPU and memory metrics;
+- cumulative byte, packet, and drop counters for one explicitly configured network interface;
 - Fluent Bit and the standard vmconfig receive/reconfigure workflow.
+
+The interface name is passed to nstance-agent as `NSTANCE_METRICS_INTERFACE`. Omitting it disables interface and conntrack collection. Each report contains one current metrics observation; the server derives throughput, packet, and drop rates from consecutive timestamped reports. Collection failures are reported explicitly rather than represented as zero values.
 
 ## Vertical scaling
 
@@ -102,22 +131,22 @@ Each dedicated NAT instance scales vertically using A/B deployments; small-clust
 
 Nstance-server evaluates:
 
-- throughput against provider instance bandwidth;
-- packets per second against instance capability;
+- throughput derived from cumulative byte counters against provider instance bandwidth;
+- packets per second derived from cumulative packet counters against instance capability;
 - `nf_conntrack_count` against `nf_conntrack_max`;
 - CPU utilization;
-- packet drops.
+- packet drops per second derived from cumulative drop counters.
 
-Scale up when any configured threshold remains exceeded for a configurable two-to-five-minute window. Scale down only when all metrics remain below their configured thresholds for a configurable 20-to-30-minute window. After replacement, enforce a configurable ten-minute cooldown.
+Scale up when any configured threshold remains exceeded for `scale_up_window`, which defaults to three minutes and must be between two and five minutes. Scale down only when all metrics remain at or below their configured thresholds for `scale_down_window`, which defaults to 25 minutes and must be between 20 and 30 minutes. `cooldown` defaults to ten minutes and cannot be shorter; `replacement_timeout` defaults to ten minutes and must be positive. Utilization thresholds default to 80% for scale-up and 30% for scale-down. Packet-drop thresholds default to one and zero drops per second respectively.
 
 Replacement is create-before-destroy:
 
 1. claim an unused identity and create the new instance at the selected size;
-2. wait for Nstance agent and forwarding health;
+2. wait for the Nstance agent to register and submit a successful health report;
 3. switch the subnet route;
 4. terminate the old instance and release its identity.
 
-Instance-size ladders, thresholds, windows, cooldown, and replacement timeout are configurable. The instance-size ladder is essentially an ordered slice of instance types. The instance type field on the group defines the default/starting point.
+Agent registration and a successful health report establish NAT-instance readiness. Forwarding readiness is not a separate reported metric. The instance type field on the group defines the default/starting point in its tenant's ordered `instance_type_ladder`.
 
 If no identity is available, Nstance keeps the current healthy NAT VM, reports an `identity_pool_exhausted` condition/metric, and retries later. It must not attempt a disruptive same-identity replacement. Pool exhaustion also blocks creating NAT for another subnet; Nstance should prefer populated subnets with remaining capacity before blocking node scale-up.
 
