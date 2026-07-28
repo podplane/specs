@@ -67,6 +67,7 @@ separate:
       "redirect_uris": ["http://localhost:8000/callback"],
       "trust_bindings": [
         {
+          "id": "github-production",
           "trust_policy": "acme-github",
           "subject": "trusted:github:acme/app:production",
           "groups": ["podplane:operators"],
@@ -84,6 +85,7 @@ separate:
           }
         },
         {
+          "id": "buildkite-production",
           "trust_policy": "acme-buildkite",
           "subject": "trusted:buildkite:acme/app:production",
           "groups": ["podplane:operators"],
@@ -121,6 +123,8 @@ Effective claims: A={const: 3}, B={const: 2}
 - `required_claims` are inherited and cannot be removed or replaced by a
   binding. A binding fragment for the same claim is an additional restriction.
 - Binding `subject` and `groups` replace policy values rather than merging them.
+- Each binding has an explicit `id` unique within its client. IDs are stable
+  diagnostic and audit identities; array position has no identity or precedence.
 - The effective configuration must contain a non-empty `subject` and `groups`.
 
 Fragments may use claim-value validation and applicator keywords such as

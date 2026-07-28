@@ -213,7 +213,9 @@ Tunnel providers handle public HTTP-to-HTTPS redirects at their edge and do not 
 
 While a shard's desired state is awake, its control-plane tunnel processes advertise the production path. While asleep, a wake-capable shard leader advertises a wake tunnel process targeting its local `nstance-proxy`. Reconciliation toward asleep waits for the wake tunnel process before terminating control-plane VMs; reconciliation toward awake keeps it until a production tunnel process and the requested local upstream are ready. The external tunnel endpoint remains stable.
 
-Nstance publishes generic tunnel-process desired state by logical load-balancer key, such as `/run/nstance/tunnels/control-plane-tunnel.active`. vmconfig maps that key to its tunnel service. Nstance does not interpret tunnel-provider configuration.
+Nstance publishes generic tunnel-process desired state by logical load-balancer key, such as `/run/nstance/tunnels/control-plane-tunnel.active`. The file contains an opaque desired-state revision. vmconfig maps that key to its tunnel service and, only after its provider-specific readiness check succeeds, atomically writes the same revision to `/run/nstance/tunnels/control-plane-tunnel.ready`. vmconfig removes the readiness marker whenever the service stops, fails, or no longer reconciles the desired revision. Both files live under `/run`, so readiness cannot survive a reboot. Nstance does not invoke systemd or interpret tunnel-provider configuration.
+
+For a wake tunnel on the local `nst` VM, nstance-server reads the matching readiness marker directly. For production tunnels on `knc` VMs, nstance-agent reports the logical key and ready revision in its normal health report. Nstance treats only an exact desired/ready revision match as readiness; process existence, systemd active state, agent health, and a stale readiness marker are insufficient individually. vmconfig owns the provider-specific test that establishes readiness, such as checking both the service state and the tunnel client's local readiness endpoint.
 
 Cloudflare tunnel processes using one credential provide availability but no traffic steering. Therefore production and wake tunnel processes may overlap only during transitions, when both paths can serve requests; the wake tunnel process must be withdrawn while the tenant is awake so normal traffic bypasses `nstance-proxy`.
 
@@ -227,7 +229,7 @@ Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and co
 
 Nstance's secret cache remains in-memory and per server process. Initial misses for one source are coalesced so local and agent delivery cause one provider read per cache lifetime. Secret values are not persisted in shared Nstance state. vmconfig-owned watchers install them with strict ownership and modes and restart only affected services; secrets must not appear in generated Terraform values, process arguments, logs, or world-readable files.
 
-Nstance writes only generic proxy, file, and tunnel-process state. vmconfig translates it into provider-specific service configuration, keeping Cloudflare- or ngrok-specific paths and commands out of Nstance.
+Nstance writes only generic proxy, file, and revisioned tunnel-process desired state and consumes only generic matching readiness revisions. vmconfig translates desired state into provider-specific service configuration and readiness, keeping Cloudflare- or ngrok-specific paths, commands, and probes out of Nstance.
 
 ## Configuration
 

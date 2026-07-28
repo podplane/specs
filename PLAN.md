@@ -68,7 +68,7 @@
   - call only listener-scoped `WakeTenant` over the root-owned Unix socket;
   - forward to the returned private `IP:target_port` and let established connections drain after direct routing is restored.
 - Add server-side Unix-socket authorization and return an upstream only after agent health and target-port readiness are both satisfied.
-- Write generic tunnel-process desired state under `/run/nstance/tunnels/<load-balancer-key>.active`; keep tunnel-provider commands out of Nstance.
+- Write an opaque revision as generic tunnel-process desired state under `/run/nstance/tunnels/<load-balancer-key>.active`; consider only a matching vmconfig-written `.ready` revision ready, reading it locally for `nst` wake tunnels and from normal agent health reports for `knc` production tunnels. Keep systemd and tunnel-provider commands and probes out of Nstance.
 - Implement bounded secret-cache miss coalescing and atomic delivery of `proxy.files` to the local receive directory and existing agent file streams.
 **Exit gate:** proxy integration tests cover connection holding, timeout, listener isolation, destination-IP dispatch, zero-sized group exclusion, partial upstream health, restart, and concurrent wake calls.
 ### Phase 4: Strengthen provider load-balancer adapters and cutover state machines
@@ -98,8 +98,8 @@
   - add/remove VM-IP endpoints and wait for backend health/draining;
   - support the Nstance-server subnet endpoint during sleep.
 - Tunnel adapter/state machine:
-  - while going to sleep, wait for the `nst` wake tunnel process to be active before terminating control-plane VMs;
-  - while waking, keep the wake tunnel process active until a control-plane production tunnel process and the requested local upstream are ready;
+  - while going to sleep, wait for the local `nst` wake tunnel's vmconfig-written `.ready` marker to match Nstance's desired `.active` revision before terminating control-plane VMs;
+  - while waking, keep the wake tunnel desired until a control-plane agent reports the matching production-tunnel readiness revision and the requested local upstream is ready;
   - permit production/wake tunnel-process overlap only during transitions and require the wake process to be absent in steady-state awake operation;
   - treat tunnel-process readiness and withdrawal as reconciled state that resumes after leader replacement.
 **Exit gate:** deterministic provider/tunnel-process fake tests cover healthy cutover, every timeout/rollback point, AWS cross-zone confirmation before draining, tunnel-process ordering, fail-open, shard and cluster leader replacement, and no-empty-route invariants. Live cloud testing is deferred to the final cross-repository matrix after Terraform and vmconfig artifacts exist.
@@ -190,6 +190,7 @@
 - Create runtime users, strict ownership, the root-owned Unix socket, proxy-readable generated config, and systemd reload behavior after atomic replacement.
 - Install files received through Nstance's local fixed receive directory using strict modes and restart only affected services.
 - Add provider-neutral tunnel service templates driven by generic tunnel-state files.
+- Reconcile each revisioned `.active` file into the corresponding tunnel service, atomically write a matching `.ready` marker only after the provider-specific readiness probe succeeds, and remove readiness whenever the service stops, fails, or observes another revision.
 - Add Cloudflare-specific `knc` and `nst` configuration:
   - one production tunnel process per control-plane VM for kube-apiserver plus optional ingress;
   - one wake tunnel process per eligible Nstance server;

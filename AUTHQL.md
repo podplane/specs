@@ -208,6 +208,10 @@ diagnostic identities are namespaced by client ID, issuer ID, and binding ID.
 
 ## Runtime Flows
 
+These flows describe a database-backed client after static client lookup has
+failed and `authorization_source` has claimed the client ID. Static clients use
+their static flows and execute none of these queries.
+
 ### Interactive login and refresh
 
 ```text
@@ -323,13 +327,14 @@ authorization code or refresh grant. The existing credential remains retryable.
 
 3. **Client existence and cache**
    - **Repository:** `easy-oidc/easy-oidc`
-   - Resolve client existence before redirect or exchange and apply shared
-     redirect/client defaults.
+   - After static client lookup fails, resolve database client existence before
+     redirect or exchange and apply shared redirect/client defaults.
    - Add bounded positive/negative caches with request coalescing and no stale
      use after expiry.
-   - Test unknown/disabled clients, exact redirect matching, expiry, eviction,
-     concurrent misses, definitive false, malformed results, and database
-     failure before and after cache expiry.
+   - Test static clients never query PostgreSQL, plus unknown/disabled database
+     clients, exact redirect matching, expiry, eviction, concurrent misses,
+     definitive false, malformed results, and database failure before and after
+     cache expiry.
 
 4. **User authorization**
    - **Repository:** `easy-oidc/easy-oidc`

@@ -65,10 +65,10 @@ Access and ID tokens default to **15 minutes**, configured independently with
 `access_token_ttl` and `id_token_ttl`. Both refresh modes use the same rotation,
 replay detection, client binding, and revocation mechanisms.
 
-All v2 configuration durations use human-readable strings. Support positive integer
-components with `s`, `m`, `h`, and `d` units, where a day is exactly 24 hours; examples
-include `"5m"`, `"1h30m"`, and `"30d"`. Reject empty, zero, negative, fractional,
-unknown-unit, and overflow values. Omitted values select documented defaults.
+All v2 configuration durations use positive strings accepted by Go's
+`time.ParseDuration`; examples include `"5m"`, `"1h30m"`, and `"720h"`. The `d`
+unit is not supported. Reject empty, zero, negative, invalid, and overflow values.
+Omitted values select documented defaults.
 
 Client configuration uses this shape; omitted lifetime fields select the defaults:
 
@@ -78,8 +78,8 @@ Client configuration uses this shape; omitted lifetime fields select the default
   "allow_offline_access": false,
   "session_idle_ttl": "30m",
   "session_absolute_ttl": "10h",
-  "offline_idle_ttl": "30d",
-  "offline_absolute_ttl": "90d"
+  "offline_idle_ttl": "720h",
+  "offline_absolute_ttl": "2160h"
 }
 ```
 
@@ -403,9 +403,9 @@ binding will also preserve `dpop_jkt` through state and the code.
 1. **Configuration and validation**
    - Add per-client refresh enablement, offline-access allowlisting, and optional
      session/offline lifetime overrides to config types and the JSON schema.
-   - Add one duration-string type/parser and use it consistently for all v2 duration
-     configuration, including access, ID, refresh, and email OTP lifetimes; remove
-     numeric `*_seconds` configuration fields.
+   - Add one presence-aware duration-string type backed by `time.ParseDuration` and
+     use it consistently for all v2 duration configuration, including access, ID,
+     refresh, and email OTP lifetimes; remove numeric `*_seconds` configuration fields.
    - Make offline access valid only when refresh is enabled. Use presence-aware fields
      so omission selects defaults; validate all effective lifetime combinations.
    - Add separate `access_token_ttl` and `id_token_ttl` settings defaulting to `15m`.

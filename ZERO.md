@@ -135,7 +135,7 @@ Wake is deduplicated within a shard by a durable compare-and-swap that removes t
 4. Nstance waits for any configured group to provide an agent-healthy instance with the target port ready, then returns its private address.
 5. `nstance-proxy` forwards held connections to that address.
 6. Once Kubernetes starts, nstance-operator wakes any other shards required by MachinePools.
-7. Nstance waits for production NLB targets to become provider-health-check healthy and routable, or for the production tunnel process to become active and ready, then bypasses `nstance-proxy`; existing proxied connections may finish there. If readiness times out, it retains the proxy path and continues reconciliation.
+7. Nstance waits for production NLB targets to become provider-health-check healthy and routable, or for a production tunnel agent to report the vmconfig-written readiness marker matching Nstance's desired revision, then bypasses `nstance-proxy`; existing proxied connections may finish there. If readiness times out, it retains the proxy path and continues reconciliation. Nstance reads the equivalent readiness marker directly for the local `nst` wake tunnel; it does not manage or probe the provider-specific tunnel process.
 
 The local `nstance-proxy` can invoke only `WakeTenant` over a root-owned Unix socket. Nstance-server remains inaccessible from the public network.
 
