@@ -1,5 +1,7 @@
 # External OIDC Trust
 
+> **STATUS**: Ready for implementation
+
 This document specifies how Easy OIDC trusts external OIDC tokens and how the
 Podplane CLI uses that trust for secretless CI authentication.
 

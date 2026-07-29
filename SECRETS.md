@@ -1,5 +1,9 @@
 # Podplane Secrets: Spec and Implementation Plan
 
+> **STATUS**: In review
+>
+> Remaining work: cloud-provider testing/verification
+
 ## Goals
 
 Podplane should provide a unified developer experience for managing application secrets without requiring developers to have direct access to AWS, GCP, OpenBao, or other infrastructure-layer secret backends.

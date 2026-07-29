@@ -1,5 +1,7 @@
 # Podplane Local Git Cache and Server
 
+> **STATUS**: Implemented
+
 ## Goal
 
 Local Podplane clusters should be able to run Flux against cached Git repositories served by the existing Podplane local HTTPS server. This lets local VMs reconcile `platform-components` without depending on GitHub at runtime and gives Podplane developers a clean way to test local `components` changes before pushing/tagging a release.

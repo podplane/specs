@@ -29,11 +29,15 @@ The first content after every spec's top-level heading must be a status line:
 Allowed statuses:
 
 - `Draft` — material design decisions remain unresolved.
-- `Ready for implementation` — contracts and decisions are settled enough to build.
+- `Ready for implementation` — contracts and decisions are settled enough to build,
+  but material implementation has not started.
+- `In progress` — material implementation has started, but substantial required
+  scope remains.
+- `In review` — the majority of the required scope is implemented, but final review
+  and verification have not yet established that the spec is complete.
 - `Implemented` — the full required scope is implemented and verified.
 
-A partially implemented spec remains `Ready for implementation`. Split independently
-deliverable parts into separate specs when their statuses differ.
+Split independently deliverable parts into separate specs when their statuses differ.
 
 Change status only with evidence. Verify code and tests before using `Implemented`;
 do not rely on plans or checklists. New specs start as `Draft`. Ask the user when an

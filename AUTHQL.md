@@ -1,5 +1,7 @@
 # AuthQL PostgreSQL Authorization Source
 
+> **STATUS**: Ready for implementation
+
 > **Dependency:** This design depends on the external OIDC trust model in
 > [TRUST.md](./TRUST.md). Implement and verify TRUST.md before starting "AuthQL".
 

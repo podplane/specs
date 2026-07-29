@@ -1,5 +1,10 @@
 # Podplane Registry Push
 
+> **STATUS**: In review
+>
+> Remaining work: test optional Docker `/v2` and `/token` routing, conditional Docker
+> login integration, and production identity and ACL verification.
+
 ## Goal
 
 Podplane provides a cluster-hosted OCI registry for application images.

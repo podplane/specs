@@ -1,5 +1,7 @@
 # Podplane ACME Certificates
 
+> **STATUS**: In review
+
 ## Goal
 
 Podplane uses cert-manager and ACME DNS-01 challenges to issue publicly trusted certificates for supported cluster domains. Initial implementation supports AWS Route53-managed DNS only and builds on the domain model in [DOMAINS.md](./DOMAINS.md).

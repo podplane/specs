@@ -1,5 +1,7 @@
 # NLBs and Tunnels for Kubernetes API & Ingress
 
+> **STATUS**: In progress
+
 ## Goal
 
 Podplane supports two ways to expose both Traefik ingress and kube-apiserver:

@@ -1,5 +1,7 @@
 # Scale-to-Zero Kubernetes Nodes
 
+> **STATUS**: In progress
+
 ## Goal
 
 Scale-to-zero should feel like **Wake-on-LAN for Kubernetes**. Podplane may stop every Kubernetes node, then wake the cluster for:

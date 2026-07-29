@@ -1,5 +1,7 @@
 # Podplane Cluster Domains
 
+> **STATUS**: In review
+
 ## Goal
 
 Podplane clusters may optionally have one or more domains for application ingress and stable cluster endpoints. Domain configuration is independent of the infrastructure provider: for example, a cluster may run on AWS while Cloudflare manages its DNS.

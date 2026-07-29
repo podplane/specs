@@ -1,5 +1,7 @@
 # Podplane NAT
 
+> **STATUS**: In progress
+
 ## Goal
 
 Podplane can use either Cloud Managed NAT or Podplane Managed NAT VMs without changing the cluster subnet model. AWS and Google Cloud use provider-native routing, but expose the same Podplane configuration and lifecycle.
