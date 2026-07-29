@@ -1,5 +1,7 @@
 # Refresh Token Support
 
+> **STATUS**: Implemented
+
 This document specifies refresh tokens for Easy OIDC and the implementation plan.
 
 ## Versioning

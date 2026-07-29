@@ -46,63 +46,69 @@
 - [x] Regenerate protobuf code and update server, agent, operator, and tests atomically for the 2.0.0 contract; do not retain legacy fields or decoders solely for 1.x clients/configuration.
 **Exit gate:** configuration validation rejects every invalid collision/topology listed in the three specs, and all Nstance consumers use the new generated protobuf and configuration contracts.
 ### Phase 2: Add durable tenant sleep state and transition serialization
-- Add `shard/<shard>/tenants.jsonc` storage models and ETag/generation compare-and-swap helpers.
-- Implement idempotent sleep-entry add/update and removal without writing desired group sizes into tenant state.
-- Add a tenant-scoped transition lock that serializes:
-  - normal and forced sleep;
-  - network and timer wake;
-  - proxy payload arrival during sleep;
-  - provider target cutovers.
-- Resume incomplete reconciliation from durable state after process restart or shard-leader replacement.
-- Add per-shard wake timers from `wake_at`; concurrent timer and network wakes must converge through the same CAS operation.
-- Ensure effective group size is zero only while the sleep entry exists, while preserving administrator/operator desired sizes in the existing group state.
-- Keep tenant state shard-local. Add only the AWS cross-zone disable barrier to cluster-leader coordination.
+- [x] Add `shard/<shard>/tenants.jsonc` storage models and ETag/generation compare-and-swap helpers.
+- [x] Implement idempotent sleep-entry add/update and removal without writing desired group sizes into tenant state.
+- [ ] Add a tenant-scoped transition lock that serializes:
+  - [x] normal and forced sleep;
+  - [x] network and timer wake;
+  - [ ] proxy payload arrival during sleep;
+  - [ ] provider target cutovers.
+- [x] Resume sleep-state reconciliation from durable state after process restart or shard-leader replacement.
+- [x] Add per-shard wake timers from `wake_at`; concurrent timer and network wakes converge through the same CAS operation.
+- [x] Ensure effective group size is zero only while the sleep entry exists, while preserving administrator/operator desired sizes in the existing group state.
+- [x] Keep tenant state shard-local.
+- [ ] Add only the AWS cross-zone disable barrier to cluster-leader coordination.
 **Exit gate:** storage tests cover CAS conflicts, restart/failover, simultaneous wake triggers, sleep updates, and removal of empty tenant keys; reconciliation tests prove desired sizes survive sleep.
 ### Phase 3: Implement listener derivation and `nstance-proxy`
-- Derive the static `listeners` map at config load and reload time, with listener identity represented only by the map key. Use `<load-balancer-key>:<proxy-port>` for AWS and tunnel listeners; for Google Cloud, use `<load-balancer-key>:<port>` when the port is unique or `<load-balancer-key>/<destination-ip>:<port>` when a shared port requires destination-IP dispatch. Reject cross-tenant references, zero-sized wake targets, invalid ports, duplicate Google Cloud destination-IP/port selectors, proxy-port collisions, and server-port collisions.
-- Atomically write `/run/nstance/nstance-proxy.json` with root ownership and proxy-readable permissions. Rewrite it only for static config changes, not membership changes.
-- Add the `nstance-proxy` binary:
-  - bind configured ports and dispatch Google Cloud shared ports by accepted destination IP;
-  - expose health checks that never call `WakeTenant`;
-  - hold client connections for a bounded configurable timeout;
-  - call only listener-scoped `WakeTenant` over the root-owned Unix socket;
-  - forward to the returned private `IP:target_port` and let established connections drain after direct routing is restored.
-- Add server-side Unix-socket authorization and return an upstream only after agent health and target-port readiness are both satisfied.
-- Write an opaque revision as generic tunnel-process desired state under `/run/nstance/tunnels/<load-balancer-key>.active`; consider only a matching vmconfig-written `.ready` revision ready, reading it locally for `nst` wake tunnels and from normal agent health reports for `knc` production tunnels. Keep systemd and tunnel-provider commands and probes out of Nstance.
-- Implement bounded secret-cache miss coalescing and atomic delivery of `proxy.files` to the local receive directory and existing agent file streams.
+- [x] Derive the static `listeners` map at config load and reload time, with listener identity represented only by the map key. Use `<load-balancer-key>:<proxy-port>` for AWS and tunnel listeners; for Google Cloud, use `<load-balancer-key>:<port>` when the port is unique or `<load-balancer-key>/<destination-ip>:<port>` when a shared port requires destination-IP dispatch. Reject cross-tenant references, zero-sized wake targets, invalid ports, duplicate Google Cloud destination-IP/port selectors, proxy-port collisions, and server-port collisions.
+- [x] Atomically write `/run/nstance/nstance-proxy.json` with root ownership and proxy-readable permissions. Rewrite it only for static config changes, not membership changes.
+- [x] Add the `nstance-proxy` binary:
+  - [x] bind configured ports and dispatch Google Cloud shared ports by accepted destination IP;
+  - [x] expose health checks that never call `WakeTenant`;
+  - [x] hold client connections for a bounded configurable timeout;
+  - [x] call only listener-scoped `WakeTenant` over the root-owned Unix socket;
+  - [x] forward to the returned private `IP:target_port` and let established connections drain after direct routing is restored.
+- [x] Add server-side Unix-socket authorization and return an upstream only after agent health and target-port readiness are both satisfied.
+- [ ] Tunnel desired state and readiness:
+  - [x] Keep production tunnel lifecycle intrinsic to `knc` vmconfig; Nstance publishes no production marker and nstance-agent reports no tunnel-specific readiness.
+  - [x] Use ordinary fresh agent health and requested upstream TCP readiness as Nstance's production recovery barrier.
+  - [ ] Publish and read revisioned markers locally on `nst` only for the wake tunnel as part of the sleep/wake cutover; Nstance never alters vmconfig-owned `.ready` files.
+  - [x] Keep systemd and tunnel-provider commands and probes out of Nstance.
+- [x] Implement bounded secret-cache miss coalescing and atomic delivery of `proxy.files` to the local receive directory and existing agent file streams.
 **Exit gate:** proxy integration tests cover connection holding, timeout, listener isolation, destination-IP dispatch, zero-sized group exclusion, partial upstream health, restart, and concurrent wake calls.
 ### Phase 4: Strengthen provider load-balancer adapters and cutover state machines
-- Replace register/deregister methods that return on API acceptance with operations that expose and wait for provider lifecycle states: registered, healthy/routable, draining, and fully deregistered.
-- Keep provider transition progress in reconciled state so leadership changes safely continue or roll back a cutover.
-- Implement the common sleep sequence:
+- [x] Add provider lifecycle inspection for registered, healthy/routable, draining, partially registered, and fully deregistered targets, and fail closed when deletion cannot confirm deregistration.
+- [ ] Keep provider transition progress in reconciled state so leadership changes safely continue or roll back a cutover.
+- [ ] Implement the common sleep sequence:
   1. perform any provider prerequisite barrier, including enabling and confirming AWS target-group cross-zone balancing;
   2. register proxy;
   3. wait for provider health/routability;
   4. start production draining;
   5. wait for a fresh agent report and perform the final busy check;
   6. restore production on activity/error, otherwise finish withdrawal and commit sleep.
-- Implement the common wake sequence:
+- [ ] Implement the common wake sequence:
   1. restore desired infrastructure;
   2. wait for upstream and production provider health;
   3. withdraw proxy with draining;
   4. leave proxy installed and continue reconciliation if production readiness times out.
-- Never permit the intended registration sets to become empty, and never interpret provider fail-open routing as readiness.
-- AWS adapter:
-  - register instance targets with per-listener port overrides;
-  - wait for target health and deregistration completion;
-  - enable target-group cross-zone balancing before sleep;
-  - let the cluster leader disable it only after all shards have restored production and removed proxies, serialized against new sleeps.
-- Google Cloud adapter:
-  - inspect configured NEGs at startup/reload and validate `GCE_VM_IP`, zone, and unique subnet mapping;
-  - select the NEG by the instance interface's subnet;
-  - add/remove VM-IP endpoints and wait for backend health/draining;
-  - support the Nstance-server subnet endpoint during sleep.
-- Tunnel adapter/state machine:
-  - while going to sleep, wait for the local `nst` wake tunnel's vmconfig-written `.ready` marker to match Nstance's desired `.active` revision before terminating control-plane VMs;
-  - while waking, keep the wake tunnel desired until a control-plane agent reports the matching production-tunnel readiness revision and the requested local upstream is ready;
-  - permit production/wake tunnel-process overlap only during transitions and require the wake process to be absent in steady-state awake operation;
-  - treat tunnel-process readiness and withdrawal as reconciled state that resumes after leader replacement.
-**Exit gate:** deterministic provider/tunnel-process fake tests cover healthy cutover, every timeout/rollback point, AWS cross-zone confirmation before draining, tunnel-process ordering, fail-open, shard and cluster leader replacement, and no-empty-route invariants. Live cloud testing is deferred to the final cross-repository matrix after Terraform and vmconfig artifacts exist.
+- [ ] Never permit the intended registration sets to become empty, and never interpret provider fail-open routing as readiness.
+- [ ] AWS adapter:
+  - [x] register instance targets with per-listener port overrides;
+  - [x] inspect aggregate target health and deregistration completion across every configured target group;
+  - [x] expose an idempotent operation that sets and confirms target-group cross-zone balancing;
+  - [ ] invoke and reconcile cross-zone enablement before sleep;
+  - [ ] let the cluster leader disable it only after all shards have restored production and removed proxies, serialized against new sleeps.
+- [ ] Google Cloud adapter:
+  - [x] inspect configured NEGs at startup/reload and validate `GCE_VM_IP`, zone, and unique subnet mapping;
+  - [x] select the NEG by the instance interface's subnet;
+  - [x] add/remove VM-IP endpoints and inspect aggregate frontend/backend health and draining;
+  - [ ] support the Nstance-server subnet endpoint during sleep.
+- [ ] Tunnel adapter/state machine:
+  - [ ] while going to sleep, wait for the local `nst` wake tunnel's vmconfig-written `.ready` marker to match Nstance's desired `.active` revision before terminating control-plane VMs;
+  - [ ] while waking, keep the wake tunnel desired until a control-plane agent is freshly healthy and the requested local upstream is ready;
+  - [ ] permit production/wake tunnel-process overlap only during transitions and require the wake process to be absent in steady-state awake operation;
+  - [ ] reconcile local wake-tunnel ownership through shard leadership without persisting a distributed old/new-leader handoff; start the new leader's wake endpoint before publishing local desired state and accept a brief wake-path interruption during failover.
+**Exit gate:** deterministic provider/tunnel-process fake tests cover healthy cutover, every timeout/rollback point, AWS cross-zone confirmation before draining, tunnel-process ordering, fail-open, shard and cluster leader replacement, and no-empty-route invariants during ordinary sleep/wake cutovers. Shard-leader replacement may cause the documented brief tunnel wake-path interruption. Live cloud testing is deferred to the final cross-repository matrix after Terraform and vmconfig artifacts exist.
 ### Phase 5: Implement placement-aware Podplane Managed NAT
 - Change subnet placement to fill sorted `/26` node subnets to 90% of AWS-conservative capacity, then round-robin across available slots.
 - Model dedicated NAT members as derived per-populated-subnet instances rather than a fixed-size group. Exclude them from MachinePool import and replica distribution.
@@ -190,7 +196,7 @@
 - Create runtime users, strict ownership, the root-owned Unix socket, proxy-readable generated config, and systemd reload behavior after atomic replacement.
 - Install files received through Nstance's local fixed receive directory using strict modes and restart only affected services.
 - Add provider-neutral tunnel service templates driven by generic tunnel-state files.
-- Reconcile each revisioned `.active` file into the corresponding tunnel service, atomically write a matching `.ready` marker only after the provider-specific readiness probe succeeds, and remove readiness whenever the service stops, fails, or observes another revision.
+- Reconcile each leader-local `nst` wake-tunnel `.active` file into the corresponding service, atomically write a matching `.ready` marker only after the provider-specific readiness probe succeeds, and remove readiness whenever the service stops, fails, or observes another revision. Production `knc` tunnels are intrinsic to VM configuration and do not use this marker contract.
 - Add Cloudflare-specific `knc` and `nst` configuration:
   - one production tunnel process per control-plane VM for kube-apiserver plus optional ingress;
   - one wake tunnel process per eligible Nstance server;
