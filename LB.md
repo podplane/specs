@@ -229,7 +229,7 @@ Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and co
 
 ## Proxy files and tunnel secrets
 
-`proxy.files` reuses the existing `FileConfig` schema and generation code for tunnel secrets and other server-local files. It is not included in the generated `nstance-proxy` configuration. Nstance-server writes these files atomically to its fixed receive directory; vmconfig validates and installs them for local services. The same tunnel secret source may also appear in a `knc` template and be delivered through the existing Nstance-agent file channel.
+`proxy.files` reuses the existing `FileConfig` schema and generation code for tunnel secrets and other server-local files. It is not included in the generated `nstance-proxy` configuration. Nstance-server atomically replaces each file in its fixed receive directory; vmconfig validates and installs them for local services. The same tunnel secret source may also appear in a `knc` template and be delivered through the existing Nstance-agent file channel. Agent transfers are patches: omitted files remain unchanged, all payloads are validated before changes are applied, and the configuration hash and completion marker are published last. Instance rotation removes files that are no longer configured.
 
 Nstance's secret cache remains in-memory and per server process. Initial misses for one source are coalesced so local and agent delivery cause one provider read per cache lifetime. Secret values are not persisted in shared Nstance state. vmconfig-owned watchers install them with strict ownership and modes and restart only affected services; secrets must not appear in generated Terraform values, process arguments, logs, or world-readable files.
 

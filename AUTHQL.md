@@ -1,14 +1,14 @@
-# AuthQL PostgreSQL Authorization Source
+# PostgreSQL Policy Database
 
-> **STATUS**: Ready for implementation
+> **STATUS**: Implemented
 
-> **Dependency:** This design depends on the external OIDC trust model in
-> [TRUST.md](./TRUST.md). Implement and verify TRUST.md before starting "AuthQL".
+> **Dependency:** This design builds on the external OIDC trust model in
+> [TRUST.md](./TRUST.md).
 
-This document specifies a PostgreSQL-backed authorization source for Easy OIDC.
-It lets an application database supplement static client, group override, trust
-policy, and trust binding configuration while preserving Easy OIDC's protocol
-validation and policy evaluation.
+This document specifies the PostgreSQL policy database for Easy OIDC. It lets an
+application database supplement static client, group override, trust policy, and
+trust binding configuration while preserving Easy OIDC's protocol validation and
+policy evaluation.
 
 ## Goals
 
@@ -19,16 +19,16 @@ validation and policy evaluation.
 - Keep redirect and common client settings in Easy OIDC configuration so client
   lookup is only an existence check.
 - Reuse TRUST.md's JSON Schema compiler and exactly-one-binding evaluator.
-- Keep authorization reads low-latency, bounded, observable, and fail-closed.
-- Allow a read-only PostgreSQL role and replica without coupling authorization
-  queries to Easy OIDC's primary storage.
+- Keep policy reads low-latency, bounded, observable, and fail-closed.
+- Allow a read-only PostgreSQL role and replica without coupling policy queries
+  to Easy OIDC's state database.
 
-Webhooks, database writes, dynamic issuer registration, and a prescribed
-application schema are out of scope initially.
+Webhooks, database writes, dynamic issuer registration, and requiring applications
+to adopt a prescribed schema are out of scope.
 
 ## Conceptual Data Model
 
-An application may model authorization approximately as:
+An application may model auth policy approximately as:
 
 ```text
 clusters
@@ -75,10 +75,10 @@ relationships, is normative.
 
 ## Configuration
 
-`authorization_source` may coexist with static `clients`, `groups_overrides`,
-trust policies, and client trust bindings. Trusted issuer definitions remain
-static under `oidc_trust.issuers`; database rows reference those configured
-issuer IDs and cannot introduce a new issuer.
+`policy_database` may coexist with static `clients`, `groups_overrides`, trust
+policies, and client trust bindings. Trusted issuer definitions remain static
+under `oidc_trust.issuers`; database rows reference those configured issuer IDs
+and cannot introduce a new issuer.
 
 ```jsonc
 {
@@ -89,9 +89,9 @@ issuer IDs and cannot introduce a new issuer.
     }
   },
 
-  "authorization_source": {
-    "type": "postgres",
-    "connection_string_secret": "authorization-database-url",
+  "policy_database": {
+    "driver": "postgresql",
+    "connection_string_secret": "EASYOIDC_POLICY_DB_URL",
 
     "redirect_uris": [
       "http://localhost:8000/callback"
@@ -107,38 +107,42 @@ issuer IDs and cannot introduce a new issuer.
 
     "queries": {
       "client_exists": "SELECT EXISTS (SELECT 1 FROM clusters WHERE oidc_client_id = $1 AND enabled) AS exists",
-      "user_authorization": "SELECT authorized, groups FROM resolve_oidc_user($1, $2)",
+      "user_access": "SELECT allowed, groups FROM resolve_oidc_user($1, $2)",
       "trust_bindings": "SELECT ... WHERE c.oidc_client_id = $1 AND i.issuer_id = $2"
     },
 
-    "client_cache": {
+    "client_lookup_cache": {
       "ttl": "5m",
       "negative_ttl": "30s",
       "max_entries": 10000
     },
 
-    "schema_cache": {
+    "policy_build_cache": {
       "max_entries": 10000
     },
 
     "query_timeout": "500ms",
-    "max_connections": 4
+    "max_connections": 4,
+    "max_trust_rows": 100,
+    "max_groups": 100,
+    "max_group_bytes": 256,
+    "max_json_bytes": 65536
   }
 }
 ```
 
-All database-backed clients share `redirect_uris` and `client_defaults`. A future
-extension may return per-client settings, but the initial contract deliberately
-keeps the pre-authentication query to a cacheable existence check.
+All clients supplied by database policy share `redirect_uris` and
+`client_defaults`. Returning per-client settings is out of scope; the contract
+deliberately keeps the pre-authentication query to a cacheable existence check.
 
-### Client source selection
+### Client policy selection
 
 Easy OIDC first looks up the client ID in static configuration. If present, that
-client uses only static authorization configuration. Otherwise, Easy OIDC asks
-`authorization_source` whether the client exists and, if so, uses only that
-source for the client. It never falls through to PostgreSQL because a static
-user or trust binding was denied. Static client IDs therefore have unconditional
-precedence and incur no database query.
+client uses only static policy. Otherwise, Easy OIDC asks the policy database
+whether the client exists and, if so, uses only database policy for the client.
+It never falls through to PostgreSQL because a static user or trust binding was
+denied. Static client IDs therefore have unconditional precedence and incur no
+database query.
 
 ## Query Contracts
 
@@ -159,21 +163,21 @@ Easy OIDC runs this before redirecting an interactive user or accepting a token
 exchange. `exists=false` means unknown client. Missing, duplicate, malformed, or
 null results are indeterminate resolver failures.
 
-### User authorization
+### User access
 
-`user_authorization` receives:
+`user_access` receives:
 
 ```text
 $1 = Easy OIDC client ID
 $2 = normalized downstream user subject (email)
 ```
 
-It returns exactly one row with non-null `authorized` boolean and `groups` text
-array columns. The query must return `authorized=false` for an unknown or
-disabled client and for an unknown, disabled, or unauthorized subject. When
-true, Easy OIDC validates, deduplicates, and sorts groups; an empty array follows
-the effective `require_groups` policy. Missing, duplicate, malformed, or null
-results are indeterminate resolver failures.
+It returns exactly one row with non-null `allowed` boolean and `groups` text
+array columns. The query must return `allowed=false` and an empty group array for
+an unknown or disabled client and for an unknown, disabled, or denied subject.
+When true, Easy OIDC validates, deduplicates, and sorts groups; an empty array
+follows the effective `require_groups` policy. Missing, duplicate, malformed, or
+null results are indeterminate resolver failures.
 
 ### Trust bindings
 
@@ -210,24 +214,24 @@ diagnostic identities are namespaced by client ID, issuer ID, and binding ID.
 
 ## Runtime Flows
 
-These flows describe a database-backed client after static client lookup has
-failed and `authorization_source` has claimed the client ID. Static clients use
-their static flows and execute none of these queries.
+These flows describe a client supplied by database policy after static client
+lookup has failed and `policy_database` has claimed the client ID. Static clients
+use their static flows and execute none of these queries.
 
 ### Interactive login and refresh
 
 ```text
 1. client_exists before accepting /authorize or trusting its redirect URI
-2. client_exists + user_authorization after identity verification, before code
-3. client_exists + user_authorization again at authorization-code redemption
-4. client_exists + user_authorization on every refresh before rotation/issuance
+2. client_exists + user_access after identity verification, before code
+3. client_exists + user_access again at authorization-code redemption
+4. client_exists + user_access on every refresh before rotation/issuance
 ```
 
 These checks use the identity stored in the flow/code/grant and occur before
 issuing an authorization code, consuming a code, creating a refresh grant,
 rotating a refresh token, or signing new tokens. A cached positive client result
-may retain the documented TTL delay; authorization state and code lifetime do
-not extend it.
+may retain the documented TTL delay; stored flow state and code lifetime do not
+extend it.
 
 ### External token exchange
 
@@ -258,15 +262,15 @@ before every flow. Positive and negative entries have separate bounded TTLs and
 the cache has a size limit and request coalescing. Entries are never used after
 expiry when PostgreSQL is unavailable.
 
-User authorization and trust binding query results are not cached initially.
-This keeps grants and revocations as fresh as the selected PostgreSQL server.
-Easy OIDC uses a bounded LRU cache whose values contain only immutable compiled
-schemas. The key is a cryptographic digest of the canonical generated effective
-schema, namespaced by client/issuer/binding for diagnostics. Every exchange
-still executes `trust_bindings`; subject and normalized groups always come from
-the current query result, and removed bindings are never read from the cache.
+User access and trust binding query results are not cached. This keeps grants and
+revocations as fresh as the selected PostgreSQL server. Easy OIDC uses a bounded
+LRU policy-build cache whose values contain only immutable compiled schemas. The
+key is a cryptographic digest of the canonical generated effective schema,
+namespaced by client/issuer/binding for diagnostics. Every exchange still
+executes `trust_bindings`; subject and normalized groups always come from the
+current query result, and removed bindings are never read from the cache.
 
-A read replica is supported, but replica lag delays authorization changes.
+A read replica is supported, but replica lag delays database policy changes.
 User/group/trust revocation delay is replica lag; client revocation delay is
 replica lag plus up to the positive cache TTL. Operators needing a bounded
 revocation window must use the primary, synchronous replication, or a replica
@@ -274,8 +278,8 @@ endpoint with an enforced lag bound.
 
 ## Database and Failure Safety
 
-- Use a dedicated connection pool even if Easy OIDC later uses PostgreSQL for
-  primary storage or both pools connect to the same server.
+- Use a dedicated connection pool even if Easy OIDC later uses PostgreSQL for its
+  state database or both pools connect to the same server.
 - Load the connection string through Easy OIDC's secrets provider.
 - Require TLS except for localhost development.
 - Require a database role that cannot write application data; SQL inspection is
@@ -285,18 +289,19 @@ endpoint with an enforced lag bound.
 - Bound returned rows, JSON bytes, group count/length, and schema complexity
   before allocation or compilation.
 - Distinguish definitive policy results from indeterminate resolver failures as
-  specified below; never retain or silently fall back to stale authorization.
-- Log query name, duration, row count, cache result, client ID, issuer ID, and
-  outcome without logging credentials, raw tokens, or sensitive subjects.
+  specified below; never retain or silently fall back to stale policy.
+- Emit structured `policy database query` logs containing query name, duration,
+  row count, cache result, client ID, issuer ID, and outcome without logging
+  credentials, raw tokens, SQL, errors, or sensitive subjects.
 
-The PostgreSQL driver may be shared with future PostgreSQL primary storage, but
+The PostgreSQL driver may be shared with a future PostgreSQL state database, but
 pool configuration, credentials, health, and failure handling remain separate.
 
 ### Failure classification
 
-A well-formed `exists=false`, `authorized=false`, empty groups when groups are
+A well-formed `exists=false`, `allowed=false`, empty groups when groups are
 required, or valid zero/ambiguous trust match is a definitive policy denial. On
-refresh, definitive loss of authorization revokes the grant and returns
+refresh, definitive loss of access revokes the grant and returns
 `invalid_grant` only after revocation commits.
 
 Timeout, cancellation, connection/acquisition failure, missing/duplicate/null
@@ -306,66 +311,70 @@ returns a non-detailing temporary server error appropriate to the endpoint,
 does not negative-cache the result, and does not consume or revoke an
 authorization code or refresh grant. The existing credential remains retryable.
 
-## Implementation Plan
+## Implementation and Verification
 
-1. **Authorization source abstraction and configuration**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Complete TRUST.md first, then define client existence, user authorization,
-     and trust binding resolver contracts around its compiled policy types.
-   - Allow static and PostgreSQL sources to coexist; add deterministic
-     static-first client source selection, client defaults, query text, cache
-     settings, pool limits, and JSON Schema.
-   - Validate durations, limits, redirect URIs, SQL presence, configured static
-     issuers, and source configuration at startup; validate dynamic
-     issuer/client columns at query time.
+The implementation is owned by `github.com/easy-oidc/easy-oidc`.
 
-2. **PostgreSQL query runtime**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Add the PostgreSQL driver or reuse the selected primary-storage driver.
-   - Load credentials, create the independent read-only pool, prepare queries,
-     apply deadlines, and implement strict typed result decoding and limits.
-   - Test TLS requirements, read-only operation, pool isolation, timeout,
-     cancellation, malformed results, excess results, and database outages.
+1. **Auth policy resolution and configuration**
+   - `internal/authpolicy` exposes source-agnostic client, user, and trust
+     resolution to consumers while keeping static and PostgreSQL policy handling
+     separate.
+   - Static and database policy coexist with deterministic static-first client
+     selection. Static clients never query PostgreSQL.
+   - Configuration, defaults, validation, and the public JSON Schema use
+     `policy_database`, `driver: postgresql`, `user_access`,
+     `client_lookup_cache`, and `policy_build_cache`.
 
-3. **Client existence and cache**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - After static client lookup fails, resolve database client existence before
-     redirect or exchange and apply shared redirect/client defaults.
-   - Add bounded positive/negative caches with request coalescing and no stale
-     use after expiry.
-   - Test static clients never query PostgreSQL, plus unknown/disabled database
-     clients, exact redirect matching, expiry, eviction, concurrent misses,
-     definitive false, malformed results, and database failure before and after
-     cache expiry.
+2. **PostgreSQL policy database**
+   - Easy OIDC loads credentials through its secrets provider and creates an
+     independent, bounded, read-only pgx pool.
+   - Policy queries use deadlines and strict typed decoding with row, group,
+     JSON, wire-size, and schema-complexity limits.
+   - Unit and PostgreSQL integration tests cover TLS requirements, read-only
+     operation, pool isolation and exhaustion, timeout, cancellation, malformed
+     and partial results, excess results, and database outages.
 
-4. **User authorization**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Resolve explicit authorization and groups after identity verification,
-     before code issuance/redemption, and during every refresh, replacing static
-     `groups_overrides` behavior in PostgreSQL mode.
-   - Validate, deduplicate, sort, bound, and issue groups under current
-     `require_groups` semantics.
-   - Test unknown users with `require_groups=false`, membership grants/removals,
-     removal between authorize/callback/code redemption, empty groups, refresh
-     re-evaluation, malformed groups, and query failure without code/grant loss.
+3. **Client lookup**
+   - After static lookup fails, the resolver checks policy database client
+     existence before redirects and exchanges and applies shared client defaults.
+   - Bounded positive and negative caches coalesce concurrent misses and never
+     use expired values when PostgreSQL is unavailable. Credential issuance uses
+     a fresh lookup.
+   - Tests cover exact redirects, unknown clients, expiry, eviction, concurrent
+     misses, definitive false, malformed results, and failures around expiry.
 
-5. **Dynamic trust binding authorization**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Decode trust rows into TRUST.md policy/binding inputs, validate and overlay
-     fragments, generate effective object schemas, and require exactly one match.
-   - Cache only immutable compiled schemas in a bounded LRU keyed by canonical
-     schema digest while using current query subjects/groups on every exchange.
-   - Extend `easy-oidc trust test` to use PostgreSQL authorization sources.
-   - Test client/issuer mismatch, policy and group updates, binding removal,
-     digest invalidation/eviction, zero/ambiguous matches, invalid schemas,
-     transient retry, bounds, and replica lag behavior.
+4. **User access and groups**
+   - Easy OIDC resolves current user access and groups after identity
+     verification, before code issuance and redemption, and during every refresh.
+   - Groups are validated, deduplicated, sorted, bounded, and evaluated under the
+     effective `require_groups` setting.
+   - Tests cover unknown users, empty optional and required groups, membership
+     changes, removal during the flow, refresh re-evaluation, malformed groups,
+     and retry-safe query failures.
 
-6. **Documentation and end-to-end verification**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Document query contracts, example schemas/queries, read-only role creation,
-     TLS, replicas, cache/revocation tradeoffs, and operational monitoring.
-   - Add PostgreSQL-backed interactive login, refresh, token exchange, and trust
-     test end-to-end coverage.
-   - Benchmark cached client lookup, user groups, trust query, unchanged schema
-     reuse, and changed schema compilation, then set validated defaults/limits.
-   - Run the repository's full checks.
+5. **Dynamic trust bindings**
+   - PostgreSQL rows are decoded into TRUST.md policy and binding inputs,
+     validated, overlaid, compiled, and evaluated with exactly-one-match
+     semantics.
+   - Only immutable compiled schemas are cached in a bounded LRU keyed by their
+     canonical digest. Subjects, groups, and binding existence always come from
+     the current query snapshot.
+   - `easy-oidc trust test` resolves both static and database policy through the
+     same auth policy resolver.
+   - Tests cover mismatches, policy and group updates, binding removal, cache
+     invalidation and eviction, zero and ambiguous matches, invalid schemas,
+     transient retry, bounds, and lagging then current replica snapshots.
+
+6. **Documentation, benchmarks, and end-to-end coverage**
+   - Easy OIDC documents the query contracts, default schema and queries,
+     read-only role creation, TLS, replicas, cache and revocation tradeoffs, and
+     operational monitoring in `docs/policy-database.md`.
+   - `examples/policy-db/postgresql.sql` provides a ready-to-use PostgreSQL schema
+     compatible with the built-in queries.
+   - End-to-end coverage runs static flows first, then PostgreSQL-backed
+     interactive login, refresh, token exchange, and trust testing.
+   - Benchmarks cover cached client lookup, group normalization, trust queries,
+     the default result ceilings, unchanged schema reuse, and changed schema
+     compilation.
+   - The repository unit suite, PostgreSQL integration coverage, end-to-end suite,
+     formatting, module checks, and linter pass.

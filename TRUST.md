@@ -1,9 +1,14 @@
 # External OIDC Trust
 
-> **STATUS**: Ready for implementation
+> **STATUS**: In progress
+>
+> Easy OIDC scope (steps 1–4) is implemented and verified. Podplane service
+> login is implemented with further testing remaining. vmconfig now uses the
+> required fixed Kubernetes username behavior; its focused test and the
+> cross-repository end-to-end work remain.
 
 This document specifies how Easy OIDC trusts external OIDC tokens and how the
-Podplane CLI uses that trust for secretless CI authentication.
+Podplane CLI uses that trust for service login.
 
 ## Goals
 
@@ -174,7 +179,7 @@ Operators can test a real external token through the complete verification and
 matching path:
 
 ```sh
-easy-oidc trust test \
+easy-oidc check trust \
   --config config.jsonc \
   --client-id cluster-production \
   --token-file github-token.jwt
@@ -187,7 +192,7 @@ the command line or prints token material. `--token-file -` reads the token from
 standard input:
 
 ```sh
-cat github-token.jwt | easy-oidc trust test \
+cat github-token.jwt | easy-oidc check trust \
   --config config.jsonc \
   --client-id cluster-production \
   --token-file -
@@ -224,7 +229,7 @@ For every external token, Easy OIDC must:
 - evaluate policies only after cryptographic and standard-claim validation; and
 - use hard HTTP deadlines and fail closed when discovery or JWKS is unavailable.
 
-Podplane asks GitHub or Buildkite to issue the external token for the target
+Podplane asks GitHub or Buildkite to issue the identity token for the target
 Easy OIDC client ID. Easy OIDC requires that audience to match the `client_id`
 in the exchange request. For example, a token issued for `cluster-production`
 cannot be exchanged for `cluster-staging`, preventing reuse across clients.
@@ -262,9 +267,9 @@ unacceptable subject tokens return RFC 8693 `invalid_request`. All token
 responses use OAuth JSON errors, `Cache-Control: no-store`, and
 `Pragma: no-cache`.
 
-Repeated exchange of a still-valid external token is permitted. Easy OIDC and
+Repeated exchange of a still-valid identity token is permitted. Easy OIDC and
 Podplane's provider-acquisition modes must never persist or log that bearer
-credential. Caller-managed token-file mode is the explicit persistence
+credential. Caller-managed identity-file mode is the explicit persistence
 exception. Easy OIDC logs the issuer, client, matched policy/binding, effective
 subject, provider run/job identifiers when available, and result.
 
@@ -281,17 +286,17 @@ podplane deploy web --name app --image ghcr.io/acme/app:latest
 
 Login mode precedence is:
 
-1. Explicit provider or token file.
-2. A recognized CI environment.
-3. Interactive authorization code with PKCE.
+1. An explicit identity provider or identity file.
+2. A recognized service environment.
+3. User login using authorization code with PKCE.
 
 Supported controls are:
 
 ```sh
-podplane login --ci-provider github-actions
-podplane login --ci-provider buildkite
-podplane login --oidc-token-file token.jwt
-podplane login --no-ci
+podplane login --identity-provider github
+podplane login --identity-provider buildkite
+podplane login --identity-file token.jwt
+podplane login --identity-provider none
 ```
 
 GitHub detection requires `GITHUB_ACTIONS=true` and the Actions OIDC token
@@ -300,25 +305,24 @@ request variables. Buildkite detection requires `BUILDKITE=true` and a usable
 standard token acquisition mechanism. Explicit flags override detection and
 conflicting recognized environments fail with an actionable error.
 
-Podplane requests the cluster's Easy OIDC client ID as the external token
+Podplane requests the cluster's Easy OIDC client ID as the identity token
 audience. For Buildkite it also requests immutable organization and pipeline ID
-claims needed by the preset. The generic token-file path accepts a JWT acquired
+claims needed by the preset. The identity-file path accepts a JWT acquired
 by another tool and never accepts the token directly on the command line.
 
-CI login must not depend on an interactive OS keyring. The kubectl exec hook
-reacquires an external CI token and exchanges it when its Easy OIDC token needs
-renewal; it stores neither token persistently. Non-secret metadata records the
-authentication mode needed by the hook. For caller-managed token-file mode, the
-hook rereads the restrictively permissioned file before every exchange. A
-long-running producer must atomically replace it before expiry; otherwise
-renewal fails and a new token or login is required.
+Service login does not depend on an interactive OS keyring. The kubectl exec
+hook reacquires an identity token and exchanges it when its Easy OIDC service
+token needs renewal; it stores neither token persistently. Non-secret metadata
+records the login mode needed by the hook. For caller-managed identity-file
+mode, the hook rereads the restrictively permissioned file before every
+exchange. A long-running producer must atomically replace it before expiry;
+otherwise renewal fails and a new token or login is required.
 
-Podplane clusters using trusted-token identities must configure Kubernetes to
-use `sub` as its username claim with an explicitly empty username prefix. This
-preserves existing Easy OIDC human usernames because their `sub` is already
-their normalized email, while allowing namespaced trusted subjects. New
-Podplane/Easy OIDC clusters should use both settings; an incompatible username
-claim or prefix makes CI login fail before changing kubeconfig.
+vmconfig always configures kube-apiserver to use `sub` as its OIDC username
+claim with no username prefix. This fixed behavior preserves existing Easy OIDC
+usernames because user-login tokens already place the normalized email in
+`sub`, while also allowing namespaced subjects in service tokens. It is not a
+mutable vmconfig or Podplane cluster setting.
 
 No additional trust policy belongs in `podplane.cluster.jsonc`. It continues to
 provide the Easy OIDC issuer and client ID; Easy OIDC owns issuers, policies,
@@ -338,79 +342,74 @@ dedicated, least-privilege Kubernetes groups rather than cluster administration.
 
 ## Implementation Plan
 
-1. **Easy OIDC configuration**
+1. [x] **Easy OIDC configuration**
    - **Repository:** `easy-oidc/easy-oidc`
-   - Add issuer, policy, per-claim schema, and trust-binding types and update the
+   - [x] Add issuer, policy, per-claim schema, and trust-binding types and update the
      Easy OIDC configuration JSON Schema.
-   - Add `github.com/santhosh-tekuri/jsonschema/v6`, pin Draft 2020-12, disable
+   - [x] Add `github.com/santhosh-tekuri/jsonschema/v6`, pin Draft 2020-12, disable
      external loading, and compile generated effective schemas at startup.
-   - Implement inheritance and effective-binding validation, including
+   - [x] Implement inheritance and effective-binding validation, including
      non-overridable required fragments, provider-known claims, unique IDs,
      `trusted:` subjects, effective groups, schema/claim limits, and startup
      rejection of invalid configuration.
-   - Test generated `required` properties, fragment overrides, required-fragment
+   - [x] Test generated `required` properties, fragment overrides, required-fragment
      composition, prohibited keywords/loaders, limits, and schema errors.
-   - Benchmark 1, 10, 100, and 1,000 candidate schemas and set a validated
+   - [x] Benchmark 1, 10, 100, and 1,000 candidate schemas and set a validated
      per-client/issuer binding limit before release.
 
-2. **External issuer verification**
+2. [x] **External issuer verification**
    - **Repository:** `easy-oidc/easy-oidc`
-   - Add bounded discovery/JWKS clients and generic JWT verification.
-   - Add GitHub Actions and Buildkite presets with pinned issuer details and
+   - [x] Add bounded discovery/JWKS clients and generic JWT verification.
+   - [x] Add GitHub Actions and Buildkite presets with pinned issuer details and
      provider claim validation.
-   - Test discovery issuer mismatch and redirects, issuer/audience confusion,
+   - [x] Test discovery issuer mismatch and redirects, issuer/audience confusion,
      algorithm substitution, multi-audience tokens, expiry/age, unknown keys,
      malformed claims, outages, and key rotation.
 
-3. **Policy and token exchange**
+3. [x] **Policy and token exchange**
    - **Repository:** `easy-oidc/easy-oidc`
-   - Add the RFC 8693 grant to `/token` and discovery metadata.
-   - Evaluate every compiled candidate schema for the target client and verified
+   - [x] Add the RFC 8693 grant to `/token` and discovery metadata.
+   - [x] Evaluate every compiled candidate schema for the target client and verified
      issuer, require exactly one match, and issue one short-lived ID token with
      explicit subject, groups, provenance, audience, and `jti` in the standard
      RFC 8693 `access_token` response field.
-   - Add OAuth error/no-store behavior and security-safe structured logging.
-   - Test strict JSON types, schema composition, zero/ambiguous matches,
+   - [x] Add OAuth error/no-store behavior and security-safe structured logging.
+   - [x] Test strict JSON types, schema composition, zero/ambiguous matches,
      cross-client audiences, bounded diagnostics, and absence of refresh tokens.
-   - Update Easy OIDC configuration and security documentation, then run the
+   - [x] Update Easy OIDC configuration and security documentation, then run the
      repository's full checks.
 
-4. **Trust policy testing**
+4. [x] **Trust policy testing**
    - **Repository:** `easy-oidc/easy-oidc`
-   - Add `easy-oidc trust test` with full token verification from a file or
+   - [x] Add `easy-oidc check trust` with full token verification from a file or
      standard input using the production evaluator.
-   - Report bounded per-binding diagnostics, effective subject/groups, and
+   - [x] Report bounded per-binding diagnostics, effective subject/groups, and
      exactly-one-match exit status without exposing token material.
-   - Test file/stdin input, valid, invalid, zero-match, ambiguous-match, and
+   - [x] Test file/stdin input, valid, invalid, zero-match, ambiguous-match, and
      redaction behavior.
 
-5. **Podplane acquisition and login**
+5. [ ] **Podplane acquisition and login**
    - **Repository:** `podplane/podplane`
-   - Add GitHub and Buildkite environment detection and token acquisition behind
-     a generic external-token exchange interface.
-   - Add `--ci-provider`, `--oidc-token-file`, and `--no-ci` with the precedence
-     and conflict behavior above.
-   - Extend auth metadata and the kubectl exec hook for non-persistent CI token
-     reacquisition and exchange; redact all token material from errors and logs.
-   - Test provider reacquisition, atomically rotated token files, and expired
+   - [x] Add GitHub and Buildkite environment detection and identity-token acquisition
+     behind a generic exchange interface.
+   - [x] Add `--identity-provider` and `--identity-file` with the precedence and
+     conflict behavior above; `--identity-provider=none` forces a user login.
+   - [x] Extend auth metadata and the kubectl exec hook for non-persistent identity
+     token reacquisition and exchange; redact all token material from errors and
+     logs.
+   - [x] Test provider reacquisition, atomically rotated identity files, and expired
      static token files after both upstream and downstream token expiry.
 
-6. **Kube-apiserver username configuration**
+6. [ ] **Kube-apiserver username configuration**
    - **Repository:** `podplane/vmconfig`
-   - Accept the OIDC username claim and prefix through vmconfig's stable input
-     contract and configure kube-apiserver accordingly.
-   - Test `sub` with an explicitly empty prefix, preserve existing defaults for
-     callers that omit the new inputs, and document the contract.
+   - [x] Configure kube-apiserver to always use the OIDC `sub` claim with no username
+     prefix. These are fixed vmconfig behavior rather than mutable inputs.
+   - [ ] Add a focused test for the fixed behavior and document the contract.
 
-7. **Podplane cluster integration and verification**
+7. [ ] **Podplane cluster integration and verification**
    - **Repository:** `podplane/podplane`
-   - Add cluster configuration and schema support for the username prefix, use
-     `sub` with an empty prefix for new Easy OIDC clusters, and pass both values
-     through the vmconfig input contract.
-   - Reject trusted-token login against incompatible clusters and document
-     existing-cluster migration impact.
-   - Add GitHub Actions and Buildkite end-to-end tests covering login followed by
+   - [ ] Add GitHub Actions and Buildkite end-to-end tests covering login followed by
      `podplane deploy`, renewal, denied claims, wrong audiences, and ambiguous
      bindings.
-   - Update Podplane CI, login, cluster configuration, and RBAC documentation,
+   - [ ] Update Podplane CI, login, cluster configuration, and RBAC documentation,
      then run the repository's full checks.

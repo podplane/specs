@@ -49,33 +49,38 @@
 - [x] Add `shard/<shard>/tenants.jsonc` storage models and ETag/generation compare-and-swap helpers.
 - [x] Implement idempotent sleep-entry add/update and removal without writing desired group sizes into tenant state.
 - [ ] Add a tenant-scoped transition lock that serializes:
-  - [x] normal and forced sleep;
-  - [x] network and timer wake;
+  - [ ] normal and forced sleep;
+  - [ ] network and timer wake;
   - [ ] proxy payload arrival during sleep;
   - [ ] provider target cutovers.
-- [x] Resume sleep-state reconciliation from durable state after process restart or shard-leader replacement.
-- [x] Add per-shard wake timers from `wake_at`; concurrent timer and network wakes converge through the same CAS operation.
-- [x] Ensure effective group size is zero only while the sleep entry exists, while preserving administrator/operator desired sizes in the existing group state.
+- [ ] Resume sleep-state reconciliation from durable state after process restart or shard-leader replacement.
+- [x] Implement per-shard wake timers from `wake_at` and converge concurrent wake calls through the same CAS operation in the tenant-state manager.
+- [ ] Start and stop the tenant-state manager with shard leadership and compose timer and network wakes with reconciliation.
+- [ ] Ensure effective group size is zero only while the sleep entry exists, while preserving administrator/operator desired sizes in the existing group state.
 - [x] Keep tenant state shard-local.
 - [ ] Add only the AWS cross-zone disable barrier to cluster-leader coordination.
 **Exit gate:** storage tests cover CAS conflicts, restart/failover, simultaneous wake triggers, sleep updates, and removal of empty tenant keys; reconciliation tests prove desired sizes survive sleep.
 ### Phase 3: Implement listener derivation and `nstance-proxy`
-- [x] Derive the static `listeners` map at config load and reload time, with listener identity represented only by the map key. Use `<load-balancer-key>:<proxy-port>` for AWS and tunnel listeners; for Google Cloud, use `<load-balancer-key>:<port>` when the port is unique or `<load-balancer-key>/<destination-ip>:<port>` when a shared port requires destination-IP dispatch. Reject cross-tenant references, zero-sized wake targets, invalid ports, duplicate Google Cloud destination-IP/port selectors, proxy-port collisions, and server-port collisions.
-- [x] Atomically write `/run/nstance/nstance-proxy.json` with root ownership and proxy-readable permissions. Rewrite it only for static config changes, not membership changes.
+- [x] Derive the static `listeners` map at config load and reload time, with listener identity represented only by the map key. Use `<load-balancer-key>:<proxy-port>` for AWS and tunnel listeners; for Google Cloud, use `<load-balancer-key>:<port>` when the port is unique or `<load-balancer-key>/<destination-ip>:<port>` when a shared port requires destination-IP dispatch. Do not infer runtime wake eligibility from the static group size; reject cross-tenant references, invalid ports, duplicate Google Cloud destination-IP/port selectors, proxy-port collisions, and server-port collisions.
+- [x] Add an atomic writer for `/run/nstance/nstance-proxy.json` with root ownership and proxy-readable permissions.
+- [ ] Publish the proxy configuration on server startup and static config changes, and make `nstance-proxy` wait for its initial publication and reload replacements.
 - [x] Add the `nstance-proxy` binary:
   - [x] bind configured ports and dispatch Google Cloud shared ports by accepted destination IP;
   - [x] expose health checks that never call `WakeTenant`;
   - [x] hold client connections for a bounded configurable timeout;
   - [x] call only listener-scoped `WakeTenant` over the root-owned Unix socket;
   - [x] forward to the returned private `IP:target_port` and let established connections drain after direct routing is restored.
-- [x] Add server-side Unix-socket authorization and return an upstream only after agent health and target-port readiness are both satisfied.
+- [x] Add a root-owned, proxy-readable Unix-socket server that exposes only `WakeTenant`.
+- [ ] Start and stop the wake server with shard leadership and return an upstream only after agent health and target-port readiness are both satisfied.
 - [ ] Tunnel desired state and readiness:
   - [x] Keep production tunnel lifecycle intrinsic to `knc` vmconfig; Nstance publishes no production marker and nstance-agent reports no tunnel-specific readiness.
   - [x] Use ordinary fresh agent health and requested upstream TCP readiness as Nstance's production recovery barrier.
   - [ ] Publish and read revisioned markers locally on `nst` only for the wake tunnel as part of the sleep/wake cutover; Nstance never alters vmconfig-owned `.ready` files.
   - [x] Keep systemd and tunnel-provider commands and probes out of Nstance.
-- [x] Implement bounded secret-cache miss coalescing and atomic delivery of `proxy.files` to the local receive directory and existing agent file streams.
-**Exit gate:** proxy integration tests cover connection holding, timeout, listener isolation, destination-IP dispatch, zero-sized group exclusion, partial upstream health, restart, and concurrent wake calls.
+- [x] Implement bounded secret-cache miss coalescing and validated file-patch delivery with hash/completion publication through existing agent file streams; instance rotation removes files that are no longer configured.
+- [x] Add `proxy.files` generation and an atomic local receive-directory writer.
+- [ ] Publish `proxy.files` to the local receive directory as part of the server/proxy composition.
+**Exit gate:** proxy integration tests cover connection holding, timeout, listener isolation, destination-IP dispatch, runtime exclusion of groups with zero preserved desired size, partial upstream health, restart, and concurrent wake calls.
 ### Phase 4: Strengthen provider load-balancer adapters and cutover state machines
 - [x] Add provider lifecycle inspection for registered, healthy/routable, draining, partially registered, and fully deregistered targets, and fail closed when deletion cannot confirm deregistration.
 - [ ] Keep provider transition progress in reconciled state so leadership changes safely continue or roll back a cutover.
@@ -84,7 +89,7 @@
   2. register proxy;
   3. wait for provider health/routability;
   4. start production draining;
-  5. wait for a fresh agent report and perform the final busy check;
+  5. wait for a fresh agent report and perform the busy check immediately before withdrawal completes;
   6. restore production on activity/error, otherwise finish withdrawal and commit sleep.
 - [ ] Implement the common wake sequence:
   1. restore desired infrastructure;
@@ -95,7 +100,7 @@
 - [ ] AWS adapter:
   - [x] register instance targets with per-listener port overrides;
   - [x] inspect aggregate target health and deregistration completion across every configured target group;
-  - [x] expose an idempotent operation that sets and confirms target-group cross-zone balancing;
+  - [ ] expose an idempotent operation that sets and confirms target-group cross-zone balancing;
   - [ ] invoke and reconcile cross-zone enablement before sleep;
   - [ ] let the cluster leader disable it only after all shards have restored production and removed proxies, serialized against new sleeps.
 - [ ] Google Cloud adapter:
