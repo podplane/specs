@@ -1,777 +1,446 @@
 # DPoP Sender-Constrained Tokens
 
-> **STATUS**: Ready for implementation
+> **STATUS**: Implemented
 
 > **Dependency:** This design depends on the refresh-grant and distinct-token model in
 > [REFRESH.md](./REFRESH.md). Implement and verify REFRESH.md before starting DPoP.
 >
-> **Normative standards:** RFC 9449, RFC 7638, RFC 8032, RFC 8037, RFC 9126, and
-> RFC 9864.
+> **Normative standards:** RFC 9449, RFC 7638, RFC 9126, and RFC 7009.
 
-This document specifies RFC 9449 Demonstrating Proof of Possession (DPoP) for
-Easy OIDC and the implementation plan. DPoP binds OAuth access and public-client
-refresh tokens to a key held by the client so copying a token alone is insufficient
-to use it.
+This document specifies Demonstrating Proof of Possession (DPoP) for Easy OIDC.
+DPoP binds authorization codes, access tokens, and public-client refresh grants to an
+ES256/P-256 or ES512/P-521 key held by the client. The implementation owner is
+`github.com/easy-oidc/easy-oidc`.
 
-## Goals
+## Goals and Scope
 
-- Implement interoperable RFC 9449 authorization-code, token-endpoint, and protected-
-  resource behavior rather than an application-specific proof protocol.
-- Bind authorization codes, access tokens, and public-client refresh grants to the
-  same client-generated key.
-- Prevent a DPoP-bound token from being downgraded to bearer authentication.
-- Preserve ordinary bearer operation for clients that do not enable DPoP.
-- Make proof validation reusable and strict enough for Easy OIDC's `/userinfo`
-  endpoint and document the same contract for application resource servers.
-- Enforce short proof lifetimes and durable replay detection without requiring an extra
-  nonce-challenge round trip.
-- Support browser clients whose private key is non-extractable and whose tokens are
-  held by a backend-for-frontend (BFF).
+- Implement the RFC 9449 authorization-code, token-endpoint, and protected-resource
+  contract with pushed authorization requests (PAR).
+- Prevent bearer downgrade and require the same key throughout a DPoP grant.
+- Retain ordinary bearer behavior under separate client IDs.
+- Enforce short-lived, single-use proofs with shared durable replay storage and no
+  nonce challenge.
+- Prevent a copied DPoP token from being used to revoke its grant.
 
 Dynamic client registration, token introspection, confidential clients, mTLS, and
 DPoP-bound RFC 8693 token exchange are out of scope. DPoP is not client authentication,
-does not replace PKCE or TLS, does not sign request bodies or general headers, and does
-not protect against code actively executing in the legitimate client context.
+does not replace PKCE or TLS, does not sign bodies or general headers, and does not
+protect against code executing in the legitimate client context.
 
-## Client Configuration
+## Client Policy
 
-DPoP is selected per downstream client:
+Each client has a `dpop` mode:
 
 ```jsonc
 "clients": {
-  "browser-app": {
+  "browser-dpop": {
     "redirect_uris": ["https://app.example.com/callback"],
-    "dpop": "required",
-    "dpop_signing_alg": "ES512",
-    "require_pushed_authorization_requests": true,
+    "dpop": {
+      "mode": "required",
+      "signing_algorithm": "ES512"
+    },
+    "require_par": true,
     "refresh_tokens": { "enabled": true }
   },
-  "podplane-cli": {
-    "redirect_uris": ["http://localhost:8000/callback"],
-    "dpop": "disabled"
+  "browser-bearer": {
+    "redirect_uris": ["https://app.example.com/callback"],
+    "dpop": { "mode": "disabled" }
   }
 }
 ```
 
-The allowed values are:
+Only these values are valid:
 
-- `disabled` (the default): issue only bearer tokens. Reject `dpop_jkt` at
-  `/authorize` or `/par` and reject an unexpected `DPoP` header at those endpoints or
-  `/token` with `invalid_request` rather than silently ignoring it.
-- `optional`: accept either a complete bearer flow or a complete DPoP flow. Presence
-  of `dpop_jkt` on a direct authorization request, or `dpop_jkt` or a proof at PAR,
-  selects DPoP and binds the resulting code; absence of all applicable inputs selects
-  bearer. A code or refresh grant can never change modes later.
-- `required`: require key binding through `dpop_jkt` or the PAR proof and a matching
-  DPoP proof at code redemption and every refresh. Never issue bearer access or refresh
-  tokens.
+- `disabled` (default) issues bearer tokens. The authorization, PAR, token, refresh,
+  and revocation endpoints reject `dpop_jkt` or a `DPoP` header with
+  `invalid_request`.
+- `required` requires a DPoP binding at authorization and a matching proof at code
+  redemption, refresh, and revocation. It never issues bearer access or refresh tokens.
 
-Optional mode is for migrations and clients that deliberately support both modes.
-Security-sensitive clients should use `required` and must verify that successful token
-responses contain a case-insensitive `token_type` value of `DPoP`. The client mode
-governs authorization-code access-token issuance, public-client refresh, and the token-
-independent revocation proof policy. The RFC 8693 ID-token exchange specified by
-TRUST.md remains unchanged for every mode.
+A deployment that supports both presentation types uses separate client IDs. There is
+no optional or per-request mode selection. Changing a client ID's mode or signing
+algorithm is not an in-place migration: operators must create a new client ID and users
+must start new authorization flows. Already-issued access tokens remain governed by
+their `cnf.jkt` until expiry.
 
-For an optional or required client, `dpop_signing_alg` selects exactly one proof
-profile and defaults to `ES256` for compatibility. The accepted values are `ES256`,
-`ES384`, `ES512`, and `Ed448`. Authorization parameters and proof headers cannot
-override the configured profile. Every proof throughout a grant must use that profile;
-changing it invalidates existing DPoP grants and requires reauthorization rather than
-silently grandfathering or downgrading them. Disabled clients reject this setting.
-Whenever a pushed request, authorization state, code, or grant is consumed, require its
-stored profile to equal the client's current configuration. A mismatch invalidates that
-artifact and starts a new authorization flow. Configuration is immutable during a
-process lifetime; reload takes effect through restart before requests resume.
+`dpop.signing_algorithm` accepts `ES256` or `ES512` and defaults to `ES256` when the
+mode is `required`. ES256 requires an embedded public `EC`/`P-256` JWK; ES512 requires
+`EC`/`P-521`. A signing algorithm on a disabled profile is invalid. Key rotation within
+a grant is unsupported; loss or replacement of the private key requires a new
+authorization flow.
 
-`require_pushed_authorization_requests` defaults to `false` for compatibility. When
-true, Easy OIDC accepts authorization parameters only through an RFC 9126 pushed
-authorization request (PAR) and the browser authorization request contains only its
-one-time `request_uri` and `client_id`. Production required-DPoP browser clients should
-enable it.
+`require_par` defaults to `false`. When true, `/authorize`
+accepts only `client_id` and a PAR `request_uri`; it cannot fall back to direct
+authorization when PAR is unavailable.
 
-Easy OIDC implements this closed profile table:
+Policy is checked when creating and consuming PAR, issuing the final authorization
+code, redeeming a code, refreshing, and revoking. It is not rechecked at every login,
+connector, identity-selection, or consent UI hop. Opaque state carries the validated
+binding across those hops. Opaque state and authorization codes also carry whether the
+flow used PAR, so enabling `require_par` rejects an already-started direct flow at final
+code issuance or code redemption.
 
-| JOSE `alg` | Required public JWK | Classical security | JOSE signature |
-| --- | --- | ---: | ---: |
-| `ES256` | `kty=EC`, `crv=P-256`, 32-byte `x` and `y` | about 128 bits | 64 bytes |
-| `ES384` | `kty=EC`, `crv=P-384`, 48-byte `x` and `y` | about 192 bits | 96 bytes |
-| `ES512` | `kty=EC`, `crv=P-521`, 66-byte `x` and `y` | about 256 bits | 132 bytes |
-| `Ed448` | `kty=OKP`, `crv=Ed448`, 57-byte `x`, no `y` | about 224 bits | 114 bytes |
+## Proof Contract
 
-ES384, ES512, and Ed448 give clients security margins beyond ES256/P-256. Ed448 uses
-the fully specified JOSE algorithm registered by RFC 9864, pure Ed448 with an empty
-context, and never Ed448ph. Do not advertise or accept polymorphic `EdDSA`, Ed25519,
-RSA, MAC, `none`, or an algorithm supplied by an installed provider. Ed25519 is in the
-same approximate security class as ES256. RSA algorithm names do not constrain modulus
-size, and longer RSA hash suffixes alone do not provide a stronger public-key security
-level. Adding another profile requires a specification decision, security review,
-interoperability tests, and updated discovery metadata.
-
-## Protocol Flow
-
-```text
-client                     Easy OIDC                    resource server
-  │                             │                              │
-  │ /par + parameters + proof   │                              │
-  │────────────────────────────▶│                              │
-  │◀────────────── request_uri  │                              │
-  │                             │                              │
-  │ /authorize + request_uri    │                              │
-  │────────────────────────────▶│                              │
-  │◀────────────────────── code bound to jkt                   │
-  │                             │                              │
-  │ /token + code + DPoP proof  │                              │
-  │────────────────────────────▶│                              │
-  │◀──── DPoP access token + bound refresh token               │
-  │                             │                              │
-  │ Authorization: DPoP token + request proof                  │
-  │───────────────────────────────────────────────────────────▶│
-  │◀──────────────────────── protected response                │
-  │                             │                              │
-  │ /token + refresh token + matching DPoP proof               │
-  │────────────────────────────▶│                              │
-  │◀──── rotated refresh token + new DPoP access token          │
-```
-
-### Key generation and authorization
-
-The client generates a key matching its configured `dpop_signing_alg` before starting
-authorization. It computes `dpop_jkt` as the unpadded base64url encoding of the RFC 7638
-SHA-256 JWK thumbprint of the public key and includes it in the authorization request
-alongside PKCE:
-
-```http
-GET /authorize?response_type=code
-    &client_id=browser-app
-    &redirect_uri=https%3A%2F%2Fapp.example.com%2Fcallback
-    &code_challenge=<challenge>
-    &code_challenge_method=S256
-    &dpop_jkt=<jwk-thumbprint>
-```
-
-Easy OIDC requires `dpop_jkt` to be one canonical, unpadded base64url value decoding
-to exactly 32 bytes. Duplicate, empty, padded, malformed, or wrong-length values are
-`invalid_request`. For a validated redirect URI, authorization errors use the normal
-OAuth redirect and preserve `state`; Easy OIDC never redirects to an unvalidated URI.
-
-Preserve the exact validated thumbprint and configured algorithm through opaque browser
-state, connector callbacks, identity selection, consent, and the authorization code.
-Neither value is secret, but the browser-visible state and code remain opaque references
-as required by REFRESH.md. Do not accept either value from a callback or later flow
-step.
-
-PKCE S256 remains required. `dpop_jkt` supplements PKCE by preventing a captured code
-and verifier from being redeemed under an attacker-controlled DPoP key. The client
-should use a key scoped to the account or grant so logout or account removal can discard
-that key without affecting unrelated grants.
-
-### Pushed authorization requests
-
-Implement RFC 9126 at a published `pushed_authorization_request_endpoint`. PAR accepts
-only `POST` with a bounded `application/x-www-form-urlencoded` body, applies the same
-duplicate-parameter, client, redirect URI, response type, scope, and PKCE validation as
-`/authorize`, and stores a request object for at most 60 seconds. Public clients identify
-themselves with the body `client_id`; confidential-client authentication remains out of
-scope. A successful response returns HTTP 201 with a cryptographically random,
-unguessable `request_uri` URN and `expires_in`; the object and every authorization
-parameter stay server-side.
-
-For DPoP clients:
-
-- A required client must supply `dpop_jkt`, a DPoP proof targeting the public PAR
-  endpoint, or both. An optional client selects DPoP the same way; if neither is
-  present, the pushed request selects bearer mode. A disabled client rejects either.
-- A proof-bearing PAR request does not require a preliminary nonce challenge. A request
-  using only `dpop_jkt` does not require a proof; code redemption still proves possession
-  of that key as RFC 9449 requires.
-- Before signature verification, require a supplied proof's protected algorithm and key
-  shape to equal the client's configured profile. Its JWK thumbprint is the authoritative
-  `dpop_jkt`. If the body also contains `dpop_jkt`, require exact equality or reject the
-  PAR request.
-- Store the authoritative thumbprint and configured algorithm in the one-time pushed
-  request object. The browser authorization request may not add or override either.
-  Preserve them through authorization, the code, and token redemption as specified
-  below.
-
-For a proof-bearing request, apply the same freshness, replay, strict proof parsing, and
-storage-failure rules as `/token`. The distinct `htu` and replay-hash inputs keep the
-endpoints separate. Insert its replay reservation and create the pushed request in one
-transaction, so a storage failure consumes neither.
-
-The browser presents exactly `client_id` and `request_uri` to `/authorize`; all other
-authorization parameters, including `redirect_uri`, PKCE, scope, `state`, and
-`dpop_jkt`, come exclusively from the stored object. Require exact client equality,
-the stored profile to equal current client configuration, unexpired unused state, and an
-ordinary validated redirect URI before any redirect. Atomically consume the object when
-creating the opaque authorization state; a failed or repeated consume never resumes
-authorization. Recheck the profile when consuming that state after every callback,
-identity, or consent step. A client with
-`require_pushed_authorization_requests=true` rejects ordinary front-channel parameters
-and cannot fall back when PAR is unavailable. Other clients may use the direct
-authorization request described above, but the two forms may never be combined.
-
-### DPoP proof JWT
-
-Every proof is a compact JWS sent as the single value of the `DPoP` HTTP request
-header. Its protected JOSE header is:
+A proof is exactly one compact JWS in exactly one `DPoP` request header. Reject the
+request before decoding if the encoded proof exceeds 8 KiB. The protected header is:
 
 ```json
 {
   "typ": "dpop+jwt",
-  "alg": "ES512",
+  "alg": "<configured ES256 or ES512>",
   "jwk": {
     "kty": "EC",
-    "crv": "P-521",
-    "x": "<coordinate>",
-    "y": "<coordinate>"
+    "crv": "<P-256 for ES256 or P-521 for ES512>",
+    "x": "<public x-coordinate>",
+    "y": "<public y-coordinate>"
   }
 }
 ```
 
-An EC `jwk` has required key-bearing members `kty`, `crv`, `x`, and `y`; an OKP JWK has
-`kty`, `crv`, and `x`. It must not contain private key material. Strictly parse but
-ignore additional public-key metadata; derive the verification key and RFC 7638
-thumbprint only from the required members, and never resolve or trust `kid`, `x5*`,
-`use`, `key_ops`, `alg`, or other metadata as a key source. If `jwk.alg` is present as
-ignored metadata, require exact equality with the protected `alg` before ignoring it.
+The implementation must:
 
-Map the protected `alg` to exactly one table profile before invoking cryptography.
-Require canonical unpadded base64url and exact key lengths. For EC, reject an infinity,
-invalid, or off-curve point and nonzero unused high P-521 coordinate bits. For Ed448,
-reject a non-canonical encoding, identity or small-order point, and a key outside the
-prime-order subgroup. Reject symmetric or private keys, unlisted algorithms, duplicate
-JOSE members, unprotected headers, any `crit` or `b64` parameter, detached payloads, and
-unencoded payloads. The three compact-JWS segments are non-empty canonical unpadded
-base64url.
+1. Require protected `typ` to equal `dpop+jwt`, protected `alg` to equal the client's
+   configured algorithm at client-policy boundaries, and an embedded public JWK on the
+   corresponding curve. Reject symmetric keys, private key material, another curve or
+   algorithm, and invalid or off-curve points.
+2. Verify the ES256 or ES512 signature using only that embedded key and derive its RFC 7638
+   SHA-256 JWK thumbprint (`jkt`). A reviewed JOSE library is preferred. Its algorithm
+   selection must be constrained to the selected supported profile and its verification
+   key must be the already constrained embedded JWK. Automatic or remote key discovery through `kid`, `jku`,
+   `x5u`, `x5c`, or any similar header is prohibited.
+3. Require typed, non-empty string claims `jti`, `htm`, and `htu`, and a numeric `iat`.
+   `jti` is limited to 128 UTF-8 bytes and should contain at least 96 random bits.
+   `htm` must exactly equal the HTTP method.
+4. Accept `iat` no more than ten seconds old and no more than five seconds in the
+   future, including the boundary values.
+5. Require `htu` to exactly equal the configured trusted public endpoint string for
+   the request, excluding query and fragment. Easy OIDC constructs these strings from
+   its configured issuer; a resource server explicitly configures its public endpoint.
+   Never derive the expected value from untrusted `Host`, `Forwarded`, or
+   `X-Forwarded-*` headers. Do not apply general RFC 3986 normalization during proof
+   comparison.
+6. Reserve the proof's replay hash and reject a uniqueness conflict as replay.
+7. Where a credential is bound, require the proof JWK thumbprint to equal its stored or
+   asserted `jkt`. Protected-resource proofs additionally require `ath`, equal to the
+   unpadded base64url SHA-256 hash of the exact ASCII access-token value.
 
-The token-endpoint proof payload contains:
+Required claim types are checked without coercion. Canonical base64 encoding, duplicate
+JSON-member rejection, and arbitrary-precision treatment of fractional NumericDate
+values are not additional custom profile requirements beyond the selected JOSE
+library's behavior and these typed checks. The implementation must not silently accept
+a malformed proof, but it need not build a second general-purpose JSON or JOSE parser.
 
-```json
-{
-  "jti": "<unique proof identifier>",
-  "htm": "POST",
-  "htu": "https://auth.example.com/token",
-  "iat": 1785200000
-}
-```
+Proofs never establish identity by themselves. Every retry uses a new proof and `jti`.
+Easy OIDC does not issue `DPoP-Nonce` or `use_dpop_nonce`, and no endpoint requires a
+nonce challenge.
 
-A protected-resource proof additionally contains:
+## Authorization and PAR
 
-```json
-{
-  "ath": "<base64url(SHA-256(ASCII(access-token)))>"
-}
-```
+PKCE S256 remains required. A required-DPoP authorization carries `dpop_jkt`, the
+unpadded base64url RFC 7638 SHA-256 thumbprint of the client's public key. It must be a
+single, non-empty value decoding to 32 bytes; invalid or duplicate values produce
+`invalid_request`. For a validated redirect URI, authorization errors use the normal
+OAuth redirect and preserve `state`; errors never redirect to an unvalidated URI.
 
-Apply all of these checks before accepting a proof:
+Easy OIDC implements RFC 9126 PAR at the discovery-advertised
+`pushed_authorization_request_endpoint`:
 
-1. Require exactly one `DPoP` header containing one compact JWS and enforce an 8 KiB
-   encoded-proof limit before decoding.
-2. Strictly decode JSON objects, rejecting duplicate member names, invalid UTF-8,
-   non-numeric, non-finite, or out-of-range `iat`, non-string required claims, and
-   malformed JWKs. Compare NumericDate values without truncating fractional seconds.
-3. Require protected `typ` to be the exact string `dpop+jwt`; reject it when missing,
-   non-string, or different. Require the client's configured JOSE profile and verify
-   with that key. For ECDSA, enforce the profile's fixed-width raw `R || S` signature
-   and reject invalid scalar values or ASN.1 encodings. For Ed448, require a canonical
-   114-byte pure-Ed448 signature with an empty context; never accept Ed448ph.
-4. Require non-empty `jti`, `htm`, and `htu`. Limit `jti` to 128 UTF-8 bytes. Require
-   `htm` to exactly equal the request method. Clients should generate `jti` with at
-   least 96 bits of pseudorandomness or use a UUIDv4.
-5. Require `htu` to be an absolute URI with no userinfo, query, or fragment. Construct
-   the expected URI from the configured public endpoint while excluding the request
-   query and fragment, then apply RFC 3986 syntax- and scheme-based normalization to
-   both values. Never derive it from untrusted `Host`, `Forwarded`, or `X-Forwarded-*`
-   headers.
-6. Accept `iat` from at most five seconds in the future and no more than ten seconds in
-   the past. Boundary values are accepted; values outside the window are rejected.
-7. Atomically reject reuse of the same proof `jti` by the same JWK thumbprint, method,
-   and target URI during the acceptance window.
-8. For protected-resource requests, require `ath` and compare it in constant time to
-   the unpadded base64url-encoded SHA-256 hash of the exact ASCII access-token value.
-   For token requests, `ath` is not required and has no binding effect.
-9. When validating a bound credential, compare the RFC 7638 thumbprint of the proof
-   JWK in constant time to the code, grant, or access token's `jkt`.
+- Accept only `POST` with a strictly bounded `application/x-www-form-urlencoded` body.
+  Apply the same client authentication/identification, duplicate parameter, redirect
+  URI, response type, scope, and PKCE validation as ordinary authorization.
+- Bound aggregate admission before policy or database work. Each Easy OIDC process
+  admits at most 100 PAR requests per second with a burst of 200 and returns HTTP 429
+  with `temporarily_unavailable` and `Retry-After` when exhausted. A trusted ingress
+  should additionally enforce per-source limits appropriate to the deployment.
+- Return HTTP 201 with a client-bound, cryptographically unpredictable `request_uri`
+  and `expires_in`. Store all parameters server-side for at most 60 seconds and permit
+  exactly one consumption.
+- A required client supplies `dpop_jkt`, a proof targeting the exact public PAR
+  endpoint, or both. If a proof is supplied, its JKT is authoritative; if both are
+  supplied they must be equal. A request with neither is `invalid_request`.
+- A proof must use the client's configured signing algorithm. A request carrying only
+  `dpop_jkt` cannot reveal its curve; a later proof with the wrong profile fails. PAR
+  with a proof detects that mismatch before browser authorization begins.
+- Persist only `dpop_jkt` in the pushed request. The browser cannot add or override
+  stored parameters.
+- `/authorize` consumes only an unexpired request bound to its exact `client_id`.
+  Required-PAR clients reject direct authorization parameters. PAR and direct forms
+  cannot be combined.
 
-Each HTTP retry uses a newly generated proof and `jti`. Proofs are never credentials
-on their own and must not influence identity or authorization before the associated
-code, refresh token, or access token is independently validated.
+Proof reservation may commit before pushed-request creation. If later validation or
+creation fails, the proof remains consumed and retry requires a new proof. Likewise,
+PAR consumption may commit before ordinary browser authorization state is created. If
+state creation fails, the pushed request remains consumed and retry requires a new PAR.
+These orderings deliberately favor one-use guarantees over retrying the same artifact.
 
-### Public URL matching
+Persist the authoritative `dpop_jkt` through PAR, opaque browser state, authorization
+code, and refresh grant. Do not persist `dpop_alg`; current client policy selects the
+algorithm at code redemption, refresh, and revocation boundaries.
+Persist a boolean PAR provenance marker through opaque browser state and authorization
+code, but not through the refresh grant: PAR policy applies to authorization, not later
+refreshes.
+Do not accept the binding from callbacks or later UI steps. At final code issuance,
+recheck client policy and issue a code only if the required binding is present.
 
-For Easy OIDC, one URL builder produces discovery metadata and every expected public
-endpoint URL, including `/par`, `/token`, `/revoke`, and `/userinfo`, from the configured
-issuer URL. Require the issuer to be absolute with a host and no userinfo, query, or
-fragment; remove a trailing slash before appending endpoint paths while preserving any
-issuer path prefix. URI comparison normalizes case in scheme and host, removes a default
-port, and normalizes percent-encoding and dot segments as permitted by RFC 3986. It does
-not decode reserved characters or otherwise make two distinct paths equivalent.
+## Token Endpoint
 
-Application resource servers must configure or safely reconstruct their externally
-visible URL using only trusted proxy configuration. A proof for an internal upstream
-URL, another host, another route, or another HTTP method is invalid even if the token
-and signature are otherwise valid.
+### Authorization-code redemption
 
-### Authorization-code exchange
+A code with `dpop_jkt` requires a fresh proof targeting the exact public token endpoint.
+Validate the code, client, redirect URI, PKCE, current client policy, proof, and matching
+JKT before consuming the code. Final code revalidation, code consumption, temporary
+credential deletion, and grant creation must be atomic. Replay reservation may be in
+that transaction or may commit earlier; therefore a failed later operation can consume
+the proof but must not consume the code unless the final code transaction commits.
 
-A DPoP-selected code exchange requires a fresh proof targeting Easy OIDC's token
-endpoint. A preliminary non-mutating read may identify the code's client, DPoP mode,
-expected `dpop_jkt`, and `dpop_alg`, but it is not authoritative and does not consume
-the code. Validate the request shape, code association, current authorization, proof,
-freshness, algorithm, and proof JWK thumbprint, and prepare and sign the response tokens
-before the final transaction.
+Errors are:
 
-In one SQLite transaction, insert the proof replay reservation; reload and revalidate
-the unchanged, unexpired code, its profile equality with current client configuration,
-and every REFRESH.md redemption invariant; consume the code; delete temporary flow
-credentials; and create the initial grant/token with the same `dpop_jkt` and `dpop_alg`.
-Any failure rolls back both the replay reservation and code/grant changes. Never
-implement redemption as an authoritative read followed by a separate consume operation.
+- missing, malformed, stale, replayed, wrong-method, wrong-target, or wrong-profile proof:
+  `invalid_dpop_proof`;
+- a valid proof under a different key: `invalid_grant`;
+- a proof supplied for an unbound bearer code: `invalid_request`;
+- replay-store or final storage failure: HTTP 503 with OAuth
+  `temporarily_unavailable`.
 
-If the code has no `dpop_jkt`, reject a supplied `DPoP` header with `invalid_request`
-rather than upgrading the code.
-If the code has `dpop_jkt`, a missing proof is `invalid_dpop_proof`; a malformed,
-expired, replayed, wrong-target, or wrong-profile proof is also `invalid_dpop_proof`;
-and a valid pinned-profile proof under a different key is `invalid_grant`. None of these
-failures consumes the code. A storage failure in the final transaction returns HTTP 503
-with OAuth JSON `temporarily_unavailable` and consumes neither the proof nor the code.
+A proof failure does not consume the code. A storage failure does not consume the code
+unless its final transaction committed; a separately committed proof reservation is
+not rolled back.
 
-For a refresh-eligible exchange, copy the code's thumbprint into the grant's existing
-`dpop_jkt` field and its profile into a new `dpop_alg` field in the same transaction that
-consumes the code and creates the grant and initial refresh token. For a refresh-disabled
-exchange, use both values while issuing the access token; no persistent grant is needed.
+### Token issuance
 
-### Access and ID token issuance
-
-Every access token issued from a DPoP-selected code or bound refresh grant contains:
+Every DPoP access token contains:
 
 ```json
-"cnf": {
-  "jkt": "<jwk-thumbprint>"
-}
+"cnf": { "jkt": "<jwk-thumbprint>" }
 ```
 
-The value is the unpadded base64url RFC 7638 SHA-256 thumbprint already stored with
-the code or grant. The token response contains `token_type=DPoP`. Bearer flows omit
-`cnf` and continue returning `token_type=Bearer`.
+The response uses `token_type=DPoP`. Bearer access tokens omit `cnf` and use
+`token_type=Bearer`. ID tokens remain ordinary OIDC assertions and do not gain `cnf`.
 
-ID tokens remain ordinary OIDC identity assertions: never add `cnf` merely because
-the accompanying access and refresh tokens are DPoP-bound. Keep REFRESH.md's distinct
-ID/access token claims, `sid`, `jti`, expiry, and scope rules unchanged. DPoP does not
-change the refresh-token wire format, family lineage, expiry, consent, upstream-
-credential encryption, family-wide effect of a successfully authorized revocation, or
-refresh-token replay semantics.
+An access token's `cnf` determines how that token must be presented. Current client
+configuration must not retroactively reinterpret a stateless token. Bound tokens always
+require DPoP presentation; unbound tokens remain bearer tokens until expiry. This rule
+does not authorize in-place mode changes, which remain unsupported.
 
 ### Refresh
 
-Parse the refresh token and perform a non-mutating authenticated lookup by complete-
-token hash and `client_id`. This lookup returns the grant's `dpop_jkt` and consumed
-state and its `dpop_alg`, but must not revoke replay, acquire a claim, or otherwise
-mutate the grant. Unknown, malformed, wrong-client, expired, or revoked credentials
-return `invalid_grant`.
+Authenticate and inspect the complete refresh token and `client_id` without mutating
+refresh replay or acquiring a processing claim. Unknown, malformed, wrong-client,
+expired, or revoked tokens return `invalid_grant`.
 
-Every use of a DPoP-bound public-client refresh token then requires a fresh proof
-targeting the token endpoint whose JWK thumbprint and algorithm match
-`refresh_grants.dpop_jkt` and `refresh_grants.dpop_alg`.
-A missing, invalid, stale, or replayed proof must not acquire a refresh processing
-claim, call an upstream provider, rotate or consume the refresh token, or revoke its
-family. Return `invalid_dpop_proof` for those failures, a protected algorithm that does
-not equal the stored and currently configured profile, or a key shape that does not map
-to it. Return `invalid_grant` only for a valid pinned-profile proof whose key does not
-match the grant.
+A grant with `dpop_jkt` requires a fresh token-endpoint proof under that same key.
+Missing or invalid proofs return `invalid_dpop_proof`; a valid proof under another key
+returns `invalid_grant`. Proof failure must not consume or rotate the refresh token,
+acquire a claim, invoke an upstream provider, or revoke the family. Only after proof
+validation and replay reservation may REFRESH.md replay handling, claim acquisition,
+upstream revalidation, and atomic rotation proceed.
 
-Only after successful proof validation and replay reservation may a transaction apply
-REFRESH.md's consumed-token replay handling or acquire the refresh processing claim.
-Continue with upstream revalidation and atomic rotation unchanged. The replacement
-refresh token remains bound to the same `dpop_jkt` and `dpop_alg`; key or profile
-rotation within a grant is not supported. Every new access token contains the same
-`cnf.jkt`, and the response uses `token_type=DPoP`. Storage APIs must therefore separate
-authenticated inspection from replay revocation and claim acquisition.
+Rotation copies the same `dpop_jkt` to the replacement refresh token/grant and to every
+new access token's `cnf.jkt`; the response uses `token_type=DPoP`. A bearer grant rejects
+a proof with `invalid_request` and cannot be upgraded. A DPoP grant cannot be downgraded
+or rekeyed. Private-key loss requires reauthorization.
 
-A bearer grant rejects a supplied `DPoP` header with `invalid_request` and cannot be
-upgraded during refresh. A DPoP grant rejects a proofless request and cannot be
-downgraded. Loss of the private key therefore requires a new authorization flow; it is
-not an `invalid_grant` event that revokes the old family automatically. The client
-should revoke the old family when it still possesses a credential capable of doing so.
+## Protected Resources and UserInfo
 
-### Protected resources and `/userinfo`
-
-Present a DPoP-bound access token using both headers:
+Present a bound access token as:
 
 ```http
 Authorization: DPoP <access-token>
 DPoP: <fresh-proof-with-ath>
 ```
 
-Easy OIDC's `/userinfo` endpoint, every future Easy OIDC endpoint that accepts access
-tokens, and every DPoP-aware application resource server must:
+Easy OIDC's `/userinfo` verifier must independently validate the access token's
+signature, issuer, audience, expiry, and claims, then validate the proof, replay
+reservation, `ath`, and `cnf.jkt` equality. It must reject a bound token presented as
+Bearer and an unbound token presented as DPoP. Every Easy OIDC access-token consumer
+must use this shared verifier.
 
-1. Reject multiple `Authorization` methods or multiple `DPoP` headers.
-2. Verify the access JWT's signature, issuer, audience, expiry, and normal application
-   claims independently of the proof.
-3. Require `Authorization: DPoP` and a valid proof when the token has `cnf.jkt`.
-4. Verify proof signature, `htm`, public `htu`, `iat`, replay state, `ath`, and exact
-   thumbprint equality with the access token's `cnf.jkt`; require the algorithm/key
-   mapping in the fixed profile table and, where client policy is available, its pinned
-   profile.
-5. Reject a bound token presented as `Bearer`. Also reject an unbound token presented
-   as `DPoP`; it remains valid only through the existing bearer path.
-6. Grant access only after every token and proof check succeeds.
+Response behavior is:
 
-Use this response matrix for protected resources:
+- malformed or multiple authentication methods/headers: HTTP 400 `invalid_request`;
+- missing credentials: HTTP 401 challenge without an error;
+- invalid or expired token, including a valid wrong-key proof: HTTP 401 `invalid_token`;
+- missing, malformed, stale, replayed, wrong-method, or wrong-target proof: HTTP 401
+  `invalid_dpop_proof`;
+- valid credentials without required scope: HTTP 403 `insufficient_scope`;
+- replay-store failure: HTTP 503, with no protected response.
 
-- Multiple token-presentation methods or malformed authentication requests return HTTP
-  400 with `invalid_request`.
-- Missing credentials return HTTP 401 with a challenge and no `error` or
-  `error_description`.
-- An invalid or expired access token, or a valid proof under a key different from
-  `cnf.jkt`, returns HTTP 401 with `invalid_token`.
-- A missing, malformed, stale, replayed, wrong-target, or unacceptable-profile proof
-  returns HTTP 401 with `invalid_dpop_proof`.
-- Valid credentials lacking required scope return HTTP 403 with `insufficient_scope`.
+Put authentication errors on the `WWW-Authenticate` challenge for the attempted
+scheme. A DPoP challenge may advertise `algs="ES256 ES512"`. Resource servers supporting
+both schemes must inspect `cnf` on the bearer path and reject bearer downgrade. This is
+integration guidance for external resource servers, not functionality Easy OIDC can
+enforce outside its own endpoints.
 
-Put error parameters on the `WWW-Authenticate` challenge corresponding to the attempted
-scheme. Include only the known client's pinned profile, for example `algs="ES512"`, on
-its DPoP challenge. A challenge issued before a client is known may list the complete
-closed profile. Bound error descriptions and never reveal which sensitive claim or
-stored value differed. HTTP authentication scheme names are case-insensitive. Resource
-servers that also support bearer tokens may advertise both challenges. Browser-facing
-endpoints expose `WWW-Authenticate` through CORS.
+## Proof-Bound Revocation
 
-A resource server accepting both schemes must inspect `cnf` even on its bearer path;
-otherwise a copied DPoP-bound JWT can be replayed as an ordinary bearer token. JWT
-signature validation alone is insufficient. Easy OIDC cannot enforce this for external
-APIs, so operators must not enable DPoP for a client until every resource server that
-accepts its access tokens enforces this rule.
+`/revoke` preserves RFC 7009 token privacy while preventing a copied DPoP token from
+revoking its family:
 
-Easy OIDC must route every access-token-authenticated endpoint through one shared
-verifier that implements these checks. New endpoints may not decode or verify access
-tokens through a bypass path. Startup and endpoint tests inventory all registered
-access-token consumers. If any configured client is optional or required but DPoP
-verification or replay storage is unavailable, startup fails rather than silently
-issuing or accepting bearer tokens.
+1. Validate `client_id` and select its public policy before any token lookup.
+2. A required client must supply a fresh proof targeting the exact public `/revoke`
+   endpoint. Validate and independently reserve it without consulting the token.
+   `ath` is not required. Missing or invalid proof errors reveal only client policy and
+   proof validity.
+3. After reservation, perform one conditional token lookup/revoke operation. Revoke
+   only if the token belongs to that client and its binding equals the proof JKT.
+   Unknown, malformed, wrong-client, expired, revoked, unbound, and wrong-key tokens all
+   produce the same empty HTTP 200 and no mutation.
+4. Commit the replay reservation even when token lookup or conditional revocation finds
+   nothing. A replay conflict is a token-independent `invalid_dpop_proof` and performs
+   no token lookup.
+5. A disabled client follows ordinary RFC 7009 behavior and rejects any `DPoP` header
+   with `invalid_request`.
 
-### Revocation, logout, and other endpoints
+A replay-store or transaction outage returns HTTP 503 and changes no token state;
+token-dependent failures alone use empty HTTP 200. Revocation by any token type must
+resolve to the same client and grant binding before changing the family. Local logout
+deletes local credentials regardless of remote revocation success.
 
-Extend REFRESH.md's `/revoke` contract so possession of a copied DPoP-bound token cannot
-be used to revoke its family while preserving RFC 7009 token privacy. Authenticate the
-public `client_id` and select proof handling from client configuration before looking up
-the token; externally visible proof requirements never depend on whether the submitted
-token exists or is bound:
+The RFC 8693 exchange described by TRUST.md remains bearer-only and rejects a `DPoP`
+header with `invalid_request`; it is not changed by this spec.
 
-- A required client always supplies a fresh proof targeting the public `/revoke` URL
-  when revoking. An optional client supplies one when it wants to revoke a bound grant
-  and may omit it for a bearer grant. A disabled client rejects a supplied proof with
-  `invalid_request`.
-- When configuration requires a proof or an optional client supplies one, validate it
-  without consulting the submitted token. `ath` is not required because revocation is
-  not protected-resource access. Missing or malformed proof errors therefore disclose
-  only public client policy and supplied proof state, never token state.
-- Unknown, malformed, wrong-client, expired, already revoked, or otherwise unusable
-  tokens return the same empty HTTP 200 response. A known bound token without a valid
-  proof under its exact key also returns that response and changes no state. Never
-  return a wrong-key or missing-proof error based on token lookup.
-- For a proofless optional-client request, perform REFRESH.md's non-mutating token lookup
-  and revoke only an unbound token. A bound or unknown token receives the same empty
-  response and no mutation.
-- For every proof-bearing request, perform no preliminary token lookup. After token-
-  independent proof validation, one transaction reserves the proof; loads the submitted
-  refresh, access, or ID token for the first and only time; obtains its `dpop_jkt` and
-  `dpop_alg` from the refresh grant, access token/client policy, or ID-token `sid`; and
-  conditionally revokes only an unbound token or an exactly matching bound family.
-  Reserve every otherwise-valid proof regardless of token existence, usability, or key
-  match. Commit the reservation even when no token is found or no revocation occurs, so
-  the proof cannot later be reused with another submitted token. A uniqueness conflict
-  returns the same proof-replay error without token lookup and leaves token state
-  unchanged. The HTTP response remains the empty RFC 7009 success response for every
-  token-dependent outcome.
+## Replay Storage and Operations
 
-Application logout still deletes local credentials even when revocation fails. A BFF
-or direct DPoP client should send the proof while it still holds the grant key. The
-self-service `/grants` flow uses its separately authenticated one-time action and is
-unchanged.
+Every verifier uses a shared durable `dpop_proofs` table:
 
-Easy OIDC's initial RFC 8693 exchange returns an ID token in the OAuth `access_token`
-response field, not a resource access token. It therefore remains bearer-only, never
-adds `cnf`, and rejects a supplied `DPoP` header with `invalid_request` regardless of
-the client's DPoP mode. Supporting DPoP-bound access tokens from token exchange requires
-a separate extension to TRUST.md and is not implied by this design.
+- `replay_hash` primary key, computed as SHA-256 over a versioned, length-delimited
+  encoding of JKT, `jti`, `htm`, and the exact `htu`;
+- `expires_at`, after which the row can be removed.
 
-## Browser and BFF Integration
+A unique insert reserves a proof. Keep the row for the complete acceptance window and
+delete expired rows in bounded batches. Never store the proof, raw `jti`, public JWK,
+access token, or access-token hash. All replicas accepting proofs for the same trust
+domain must share this table; an in-process or per-replica cache is insufficient.
+Resource-server deployments maintain their own equivalently shared durable table.
 
-For browser hardening, use one non-extractable Web Crypto EC key matching the client's
-configured ES256, ES384, or ES512 profile per account slot, stored in IndexedDB. Native
-Web Crypto does not provide Ed448; do not emulate it with JavaScript or Wasm and claim
-equivalent non-extractability. Ed448 is for CLI, native, mobile, HSM, or other clients
-with a reviewed implementation. A browser private key cannot be exported, but same-
-origin JavaScript can still invoke signing; DPoP reduces harm from copied tokens and
-cookies but does not stop active XSS. Use CSP and ordinary XSS defenses independently.
+Database unavailability returns HTTP 503 and fails closed. PAR creates no pushed
+request; token operations do not consume or rotate credentials or acquire claims;
+revocation changes nothing; and protected resources grant no access. A normal process
+restart preserves unexpired reservations.
 
-A BFF holding tokens in `HttpOnly` cookies cannot create a proof for a browser-held
-key. The browser must participate at every binding point:
+If the original replay table returns intact after an outage, resume normally. If its
+records were lost through truncation, recreation, or another confirmed failure, continue
+failing every DPoP request with HTTP 503 for at least the complete 15-second acceptance
+window before accepting proofs against an empty replacement. Clients retry afterward
+with fresh proofs; the interval ensures every forgotten proof has expired.
+This operational procedure does not require a replay epoch, metadata identity,
+high-water mark, rollback quarantine, startup count scan, active counters, fixed global
+capacity, or credential invalidation protocol. Arbitrary wall-clock rollback and
+administrative database truncation are operational failures outside the protocol's
+guarantees; operators must protect and monitor the database and maintain reliable time.
 
-1. Generate the key, submit the pushed authorization request and its proof through the
-   BFF, and redirect with the returned `request_uri`. The BFF must not create a pending
-   authorization or redirect until PAR succeeds.
-2. After callback, let the BFF retain the short-lived code as a pending login. The
-   browser signs a token-endpoint proof and sends it to the BFF, which forwards it
-   unchanged. Consume the pending code only after token exchange succeeds.
-3. Return the non-secret access-token `ath` value to the browser while storing access
-   and refresh tokens only in secure `HttpOnly` cookies.
-4. For each API request, have the browser sign a proof over the public method and URL
-   with that `ath`. Choose exactly one validation topology:
-   - The BFF validates against the cookie-held access token and browser-visible BFF
-     route. It must not forward that proof as if it targeted a rewritten upstream URL.
-   - An upstream API validates while the BFF injects `Authorization: DPoP <token>` and
-     forwards the proof without changing its externally configured method and target
-     URI. The API validates the browser-visible URI, not an internal proxy URL.
-5. Refresh through an explicit browser-assisted route: the browser signs a new token-
-   endpoint proof, the BFF forwards it with the cookie-held refresh token, rotates the
-   cookies only after success, and returns the new access-token `ath`.
-6. Revoke through a browser-assisted route before deleting the slot: the browser signs
-   for Easy OIDC's public `/revoke` URL, the BFF forwards the proof with a slot token,
-   and local logout deletes the cookies regardless of the remote result.
+Log replay outcomes and storage failures without logging proofs, tokens, token hashes,
+full thumbprints, public JWKs, or raw `jti` values. Expose cleanup backlog, uniqueness
+conflicts, and storage failures. Revocation has the same per-process aggregate admission
+limit as PAR: 100 requests per second with a burst of 200, applied before body parsing,
+policy, cryptography, or database work. Cleanup removes at most 2,000 expired replay rows
+per five-second pass, leaving throughput above the combined unauthenticated admission
+rate while keeping each cleanup transaction bounded.
 
-The BFF must bind each pending login and assisted API request to the cookie session,
-account slot, client, expected `dpop_jkt`, and current `ath`; also bind pending login to
-redirect URI and PKCE state, expire it quickly, and consume it once. For token exchange
-refresh, and revocation it forwards the proof without rewriting `htu`, so the browser
-signs Easy OIDC's public endpoint URL, not the BFF route. Pending login, refresh, revoke,
-and API state transitions occur only after the downstream response is final. CORS
-deployments must allow the `DPoP` request header and expose `WWW-Authenticate`. The BFF
-never puts raw access or refresh tokens in JavaScript-readable storage or responses.
+## Browser, BFF, and Resource-Server Guidance
 
-CLI, mobile, and direct API clients may hold both tokens and the private key themselves.
-They use the standard `Authorization: DPoP` scheme and do not need the BFF adaptation.
+This section is integration guidance. It does not require Easy OIDC to implement a
+browser, BFF, or external resource-server state machine.
 
-## State, Replay, and Limits
+Browsers should create a non-extractable P-256 or P-521 Web Crypto key matching the
+client profile per account/grant slot and retain it for the grant lifetime.
+Non-extractability reduces direct key theft but does
+not prevent active same-origin code from signing; CSP and normal XSS defenses remain
+necessary.
 
-Add a logical `dpop_proofs` table to Easy OIDC's authoritative SQLite database:
+A BFF that keeps tokens in secure `HttpOnly` cookies needs browser-assisted PAR, code
+redemption, refresh, resource access, and revocation because only the browser can sign.
+It should bind pending work to the cookie session, account slot, client, JKT, PKCE state,
+and current access-token `ath`; forward proofs unchanged to the exact public endpoint;
+and update local state only after the downstream result. It must not expose raw access
+or refresh tokens to JavaScript. CORS must allow `DPoP` and expose
+`WWW-Authenticate` where applicable.
 
-- `replay_hash` primary key: SHA-256 of a versioned, length-delimited encoding of JWK
-  thumbprint, `jti`, normalized `htm`, and normalized `htu`
-- creation and expiry timestamps
-
-Also persist a replay-store initialization/epoch marker so startup can distinguish a
-valid empty table from lost, corrupt, or recreated replay history, plus a wall-clock
-high-water mark advanced transactionally with every accepted proof and every cleanup or
-deletion operation.
-
-Extend opaque authorization state, authorization codes, and pushed requests with the
-pinned `dpop_alg` alongside `dpop_jkt`, and add `refresh_grants.dpop_alg` alongside the
-reserved `dpop_jkt`. Treat either both values as present or both as absent. A migration
-must reject impossible partial states and preserve all existing bearer grants as the
-both-absent case.
-
-Never store the proof, raw `jti`, public JWK, access-token hash, or access token. Insert
-the replay hash only after the endpoint's non-mutating prerequisites, proof signature,
-and expected key binding where one exists have been validated. Revocation is the
-exception: reserve every otherwise-valid proof before token-dependent binding as defined
-above. For PAR the insert shares pushed-request creation; for code redemption it shares
-final consumption and grant creation; for revocation it shares the non-enumerating
-conditional revoke. For refresh it precedes replay handling or claim acquisition, and
-for protected resources it precedes granting access. A uniqueness conflict is proof
-replay. Keep each row through the complete inclusive acceptance window: cleanup may
-delete it only when wall time is strictly greater than 15 seconds after acceptance.
-Delete rows in bounded batches and never create a gap in the active replay window.
-
-Normal process restart preserves every unexpired row. If the replay table, epoch marker,
-or high-water mark is missing, corrupt, or recreated while previously issued credentials
-or authorization artifacts may remain valid, fail closed until the state is restored or
-the wall clock is verified against a trusted source and every affected credential and
-artifact is invalidated. A blind time-based quarantine is insufficient when history and
-its high-water mark are both unavailable; never treat a newly empty store as valid
-replay history.
-
-A wall clock below the persisted high-water mark enters fail-closed quarantine. Service
-resumes only after wall time is strictly greater than the high-water mark plus 15 seconds,
-or after all affected credentials and artifacts are invalidated. Each cleanup transaction
-first advances the high-water mark to at least its observed wall time and only then
-deletes rows; both changes commit atomically. The mark never moves backward.
-
-For `/userinfo` and application resources, replay-state failure or quarantine returns
-HTTP 503 and grants no access. An application resource server that accepts Easy OIDC
-DPoP tokens must use its own durable replay store, shared across every replica serving
-the same public endpoint and preserving the full acceptance window across normal
-restarts. An in-process or per-replica cache is not conformant to this profile. Namespace
-replay hashes by resource server and public target URI when sharing a store. Every such
-resource server must implement the same epoch/high-water loss detection, transactional
-high-water advancement, rollback quarantine, trusted-clock recovery, and fail-closed
-rules above; durable rows alone are insufficient.
-
-While replay state is unavailable or quarantined, `/token` returns HTTP 503 with OAuth
-JSON `temporarily_unavailable` and does not consume a code or refresh token, acquire a
-refresh claim, rotate credentials, or revoke a family. PAR returns HTTP 503 with OAuth
-JSON `temporarily_unavailable` and creates no pushed request. Revocation returns HTTP 503
-and must not substitute its ordinary empty success response; it reserves no proof and
-changes no token state. Transaction failure has the same endpoint-specific behavior.
-
-Apply these fixed limits before expensive parsing or signature verification:
-
-- one DPoP header and one Authorization credential
-- 8 KiB compact proof
-- 128 UTF-8 bytes for `jti`
-- ten-second proof age and five-second future clock skew
-- only the four fixed algorithm/key profiles in the Client Configuration table
-
-Log endpoint, client ID when known, JWK thumbprint prefix or a separate diagnostic
-digest, result, remote IP, and user agent. Never log proofs, raw tokens, token hashes,
-full thumbprints, public JWKs, or raw `jti` values. Emit a distinct security event for
-proof replay without conflating it with refresh-token family replay. Bound replay-store
-growth and insertion rates, clean up in bounded batches, and expose metrics for insert
-conflicts, cleanup backlog, storage failures, and fail-closed quarantine.
-
-## Nonce Challenges
-
-Easy OIDC does not require the optional RFC 9449 authorization-server nonce mechanism at
-PAR, token, revocation, UserInfo, or application resource endpoints. A valid fresh proof
-is accepted in one request. The ten-second proof window and durable atomic replay store
-provide freshness and single-use enforcement without challenge amplification, per-key
-nonce state, or an additional fail-closed storage dependency.
-
-RFC 9449 clients may implement `use_dpop_nonce` for interoperability with other servers,
-but Easy OIDC does not issue that error or `DPoP-Nonce`. Adding nonce enforcement later
-requires a separate specification and availability analysis; it must never become
-enabled implicitly through a library or provider upgrade.
+At a proxy boundary, choose one verifier and one public target: either the BFF validates
+the proof for its browser-visible route, or the upstream validates a proof for its
+explicitly configured public route. Never validate a proof against a rewritten internal
+URL. External resource servers must validate token audience and claims, `cnf.jkt`, the
+DPoP scheme and proof, exact method and public URL, `ath`, and shared replay state.
 
 ## Discovery and Compatibility
 
-Publish this OAuth authorization-server metadata in Easy OIDC's OpenID Provider
-configuration document:
+Publish:
 
 ```json
 {
-  "dpop_signing_alg_values_supported": ["ES256", "ES384", "ES512", "Ed448"],
+  "dpop_signing_alg_values_supported": ["ES256", "ES512"],
   "pushed_authorization_request_endpoint": "https://auth.example.com/par"
 }
 ```
 
-OpenID Connect discovery permits metadata parameters registered by OAuth extensions.
-Publishing the field advertises server capability, not that every client is enabled;
-the per-client mode remains authoritative.
+Discovery advertises server capability; client policy remains authoritative. Existing
+disabled clients and bearer tokens retain their shape and behavior. DPoP clients must
+compare `token_type` case-insensitively to `DPoP`, preserve the grant key, and create a
+fresh proof for every retry. Enabling DPoP requires a new client ID and coordinated
+resource-server enforcement; it is not a migration of existing bearer grants.
 
-Existing disabled clients, kubelogin configurations, and bearer resource servers keep
-their current behavior and token shape. Optional and required DPoP clients need updated
-client libraries. Easy OIDC emits the canonical value `DPoP`; a DPoP client compares
-`token_type` ASCII case-insensitively and must reject a successful response with another
-value, create a fresh proof for every retry, preserve its key for the grant's whole
-lifetime, and start a new authorization flow after key loss.
+## Security Boundaries
 
-## Security Properties and Boundaries
+- A copied bound access token is unusable at an enforcing resource server without the
+  key; a copied refresh token cannot mint tokens; and a copied token cannot revoke its
+  family.
+- PKCE remains mandatory. `dpop_jkt` prevents authorization material from being rebound
+  to another key.
+- TLS, token signature, issuer, audience, expiry, scope, and ordinary authorization
+  checks remain mandatory and independent of DPoP.
+- DPoP provides no body integrity, client authentication, immediate access-token
+  revocation, or protection after compromise of the client runtime, key, issuer, or
+  resource server.
+- DPoP is effective only when every token-accepting path checks `cnf.jkt` and prevents
+  bearer downgrade.
 
-- A copied DPoP access token cannot be used at an enforcing resource server without a
-  fresh proof from the bound key.
-- A copied public-client refresh token cannot mint new tokens without a matching proof;
-  strict refresh rotation and family replay detection still apply independently.
-- `dpop_jkt` prevents captured authorization material from being rebound to another
-  key. PKCE remains mandatory because DPoP is not a replacement for it.
-- A non-extractable browser key prevents direct private-key export but does not prevent
-  same-origin malicious code from asking the key to sign requests or pre-generating
-  proofs. The short acceptance window limits pre-generation, and durable replay state
-  prevents any accepted proof from being reused.
-- DPoP does not provide request-body integrity, client authentication, immediate access-
-  token revocation, or protection after compromise of the Easy OIDC process, resource
-  server, client runtime, or signing key.
-- TLS and audience validation remain mandatory. A resource server must validate the
-  token audience and public request URL in addition to the DPoP binding.
-- DPoP only provides its benefit where every path accepting the bound token understands
-  `cnf.jkt` and rejects bearer downgrade.
+## Implementation Plan and Verification Checklist
 
-## Implementation Plan
+1. **Configuration and schema — `github.com/easy-oidc/easy-oidc`**
+   - Add `dpop.mode=disabled|required` and `dpop.signing_algorithm=ES256|ES512` to
+     static and policy-database client defaults; reject optional mode.
+   - Add `require_par`, ES256/ES512 discovery, and durable
+     replay storage. Persist only `dpop_jkt` through PAR, state, code, and refresh.
+   - Test new-client migration rules and unchanged disabled-client bearer behavior.
 
-1. **Proof primitives and tests**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Add strict compact-JWS parsing; exact P-256, P-384, P-521, and Ed448 public JWK
-     validation; RFC 7638 thumbprints; fixed-profile signature verification; `ath`;
-     canonical public-URL matching; limits; and typed proof errors in a reusable internal
-     package.
-   - Put an application-owned strict decoding boundary in front of the existing JOSE
-     library: never use automatic key resolution or follow attacker-selected `jku`,
-     `x5u`, `x5c`, or other key sources; select only the configured fixed profile and
-     verify with the already validated embedded public JWK.
-   - Use the Go standard library for ECDSA. Gate Ed448 on a pinned, reviewed dependency;
-     do not implement the primitive locally or release it without RFC 8032, RFC 9864,
-     Wycheproof, non-canonical encoding, low-order-key, and subgroup tests.
-   - Test malformed compact forms, duplicate JSON members, private/symmetric/off-curve
-     JWKs, algorithm/curve confusion, every fixed signature width, P-521 high bits,
-     Ed448 edge cases, claim types, URL normalization, clock boundaries, `ath`, and
-     constant-time binding comparisons.
+2. **Proof verifier and replay — `github.com/easy-oidc/easy-oidc`**
+   - Use a reviewed JOSE library with constrained ES256/P-256 and ES512/P-521 profiles;
+     implement typed claims, exact trusted endpoint matching, JKT, `ath`, limits, and
+     replay hashing/reservation.
+   - Test algorithm/key confusion, remote key headers, malformed claims, signature and
+     key failures, clock boundaries, replay, exact URL/method matching, and DB outage.
+   - Test restart persistence, bounded expiry cleanup, and that ordinary replay-store
+     failures return HTTP 503 before changing protocol state. Document the operator-
+     enforced 15-second fail-closed interval after confirmed replay-record loss; silent
+     truncation cannot be detected automatically without the rejected epoch metadata.
 
-2. **Configuration, schema, and discovery**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Add per-client `dpop` mode with a secure disabled default while leaving RFC 8693
-     ID-token exchange behavior unchanged for every mode.
-   - Add the pinned `dpop_signing_alg` and `require_pushed_authorization_requests`, fail
-     startup on algorithm/provider or DPoP storage drift, advertise the closed profile
-     table and PAR endpoint, and update configuration JSON Schema, examples, migration
-     behavior, and discovery tests.
+3. **PAR and authorization — `github.com/easy-oidc/easy-oidc`**
+   - Implement bounded, authenticated, 60-second one-use PAR; proof/JKT equality;
+     required-PAR enforcement; and client-bound unpredictable request URIs.
+   - Carry only JKT through opaque state and code. Check policy at PAR creation and
+     consumption and final code issuance, not each UI hop.
+   - Test proof-first reservation failure semantics, PAR-first consumption failure
+     semantics, PKCE, duplicate parameters, override rejection, expiry, and races.
 
-3. **Authorization and code binding**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Validate `dpop_jkt` and the pinned algorithm according to client mode and preserve
-     both through OAuth state, callbacks, consent, and authorization-code storage.
-   - Implement bounded, single-use RFC 9126 PAR with proof/`dpop_jkt` equality, front-
-     channel override rejection, and required-client fail-closed behavior.
-   - Require exact code/proof thumbprint equality and put replay reservation, final code
-     revalidation/consumption, temporary-credential deletion, and grant creation in one
-     transaction; copy the thumbprint and algorithm into `refresh_grants`.
-   - Test parameter duplication/canonicalization, optional/required/disabled modes,
-     state tampering, key substitution, PKCE interaction, retry after proof failure,
-     and code redemption races.
+4. **Token issuance and refresh — `github.com/easy-oidc/easy-oidc`**
+   - Require matching proofs for code redemption and refresh; issue `cnf.jkt` access
+     tokens and `token_type=DPoP`; preserve the key through refresh rotation.
+   - Test exact errors, response-loss retries, code/refresh races, key mismatch, proof
+     failure without credential mutation, key loss, and bearer downgrade rejection.
 
-4. **Replay storage and token endpoint**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Add durable proof replay reservations, the initialization/epoch marker, fail-closed
-     loss/clock-rollback quarantine, capacity controls, and bounded cleanup using the
-     same SQLite durability and availability posture as refresh state.
-   - Split refresh inspection from mutation; authenticate and inspect the credential,
-     validate and reserve its proof, then permit consumed-token replay handling or claim
-     acquisition. Preserve key binding through rotation and return exact OAuth DPoP
-     errors without consuming otherwise retryable credentials.
-   - Test stale/future/replayed proofs, wrong methods/URLs/keys, storage outage, process
-     restart, response loss, exact inclusive retention boundaries, rollback and wall-
-     clock catch-up, and separation from strict refresh-token replay revocation.
-   - Verify PAR, token, revocation, UserInfo, and application-resource replay-store
-     outages all return 503 without creating state, mutating credentials, or granting
-     access.
+5. **UserInfo and revocation — `github.com/easy-oidc/easy-oidc`**
+   - Route access-token use through one verifier enforcing scheme, `ath`, JKT, and
+     replay. Make token `cnf` authoritative independently of current client policy.
+   - Implement policy-first revocation, independent proof reservation, and one
+     conditional lookup/revoke with identical empty 200 token-dependent outcomes.
+   - Test every bound/unbound and Bearer/DPoP combination, copied-token revocation DoS,
+     unknown/wrong-client/wrong-key tokens, replay, and storage outages.
 
-5. **Token issuance and UserInfo enforcement**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Add `cnf.jkt` only to bound access JWTs, emit the correct `token_type`, and leave ID
-     token shape unchanged.
-   - Enforce `Authorization: DPoP`, proof validation, `ath`, key binding, and replay
-     through one verifier used by `/userinfo` and every future access-token endpoint;
-     preserve bearer behavior only for unbound tokens.
-   - Test every bearer/DPoP scheme and bound/unbound token combination, malformed and
-     multiple headers, downgrade attempts, challenges, and replay-store failure.
-
-6. **Revocation and logout**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Require a matching proof and replay reservation before revoking a DPoP-bound grant
-     while preserving RFC 7009 non-enumeration and local logout behavior.
-   - Test revocation by refresh, access, and ID token; copied-token denial of service;
-     required/optional error behavior, wrong keys, and storage failure.
-
-7. **Resource-server and browser integration guidance**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Document the complete resource-server validation contract, trusted external URL
-     handling behind proxies, shared replay storage, CORS, browser Web Crypto key
-     lifecycle, BFF PAR and pending-login exchange, explicit assisted refresh, key loss,
-     and the non-secret `ath` bridge.
-   - Provide conformance fixtures containing public keys, proofs, access tokens, and
-     expected validation results without publishing any production credential.
-
-8. **End-to-end verification**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - Add direct public-client and browser/BFF end-to-end tests for PAR authorization,
-     code substitution resistance, resource access, refresh rotation, copied-token
-     failure, logout/revocation, private-key loss, and optional-mode bearer compatibility.
-   - Exercise every fixed profile with a direct client and all three Web Crypto EC
-     profiles with the browser/BFF; verify algorithm pinning, configuration-change grant
-     invalidation, and rejection of Keycloak's broader but non-profile algorithms.
-   - Assert that every fresh valid proof succeeds in one downstream request and that no
-     Easy OIDC endpoint emits `use_dpop_nonce` or `DPoP-Nonce`.
-   - Verify that disabled clients and existing kubelogin bearer flows are unchanged,
-     run the repository's full checks, and test against an independent RFC 9449 client
-     implementation.
+6. **Integration and end-to-end verification — `github.com/easy-oidc/easy-oidc`**
+   - Document concise browser/BFF/resource-server integration and provide non-secret
+     ES256 and ES512 conformance fixtures.
+   - Exercise direct and browser-assisted PAR, authorization, code exchange, resource
+     access, refresh rotation, and logout/revocation with an independent RFC 9449 client.
+   - Verify discovery, no nonce challenges, required-PAR failure behavior, disabled
+     clients, full repository checks, and bearer downgrade prevention.

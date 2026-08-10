@@ -41,7 +41,7 @@ This includes the tenant's configured NAT group in that shard. On wake, normal r
 
 The shard leader reconciles its local record and resumes unfinished work after leadership changes. Nstance does not coordinate tenant sleep state through the cluster leader or contact other shards. On AWS, shard leaders independently enable the shared target groups' cross-zone setting before sleep; the cluster leader coordinates only safely disabling it again as described in [LB.md](./LB.md). This does not change shard-local tenant state ownership.
 
-Local wake-tunnel ownership is deliberately ephemeral rather than part of durable tenant state. On shard leadership loss, the old leader withdraws its local desired marker and stops its wake endpoint. The new leader starts its wake endpoint, publishes a fresh local desired marker, and waits for matching readiness before continuing destructive reconciliation. An asleep shard can therefore have a brief wake-path interruption during leader failover; Nstance does not maintain a distributed old/new-leader tunnel handoff.
+Local wake-tunnel ownership is deliberately ephemeral rather than part of durable tenant state. On shard leadership loss, the old leader's `nstance-tunnel` control stream closes and the supervisor stops its wake endpoint. The new leader sends a fresh named identity and revision over its local supervisor stream and waits for matching readiness before continuing destructive reconciliation. An asleep shard can therefore have a brief wake-path interruption during leader failover; Nstance does not maintain a distributed old/new-leader tunnel handoff or lifecycle state files.
 
 ## Supported topologies
 
@@ -139,9 +139,9 @@ Wake is deduplicated within a shard by a durable compare-and-swap that removes t
 4. Nstance waits for any configured group to provide an agent-healthy instance with the target port ready, then returns its private address.
 5. `nstance-proxy` forwards held connections to that address.
 6. Once Kubernetes starts, nstance-operator wakes any other shards required by MachinePools.
-7. Nstance waits for production NLB targets to become provider-health-check healthy and routable. For tunnel exposure, it waits for ordinary fresh control-plane agent health and the requested upstream TCP port; the production tunnel itself is intrinsic to vmconfig and is not reported to Nstance. It then bypasses `nstance-proxy`, allowing existing proxied connections to finish there. If readiness times out, it retains the proxy path and continues reconciliation. Nstance reads a revisioned readiness marker directly only for the local `nst` wake tunnel; it does not manage or probe the provider-specific process.
+7. Nstance waits for production NLB targets to become provider-health-check healthy and routable. For tunnel exposure, it waits for ordinary fresh control-plane agent health and the requested upstream TCP port; the production tunnel itself is intrinsic to vmconfig and is not reported to Nstance. It then bypasses `nstance-proxy`, allowing existing proxied connections to finish there. If readiness times out, it retains the proxy path and continues reconciliation. For the local `nst` wake tunnel, Nstance exchanges only named identity/revision desired state and status with the least-privileged `nstance-tunnel` supervisor over its separate Unix gRPC socket.
 
-The local `nstance-proxy` can invoke only `WakeTenant` over a root-owned Unix socket. Nstance-server remains inaccessible from the public network.
+The local `nstance-proxy` uses one root-owned, proxy-accessible Unix gRPC control socket for its versioned listener stream and listener-scoped `WakeTenant`; these are the only proxy-facing operations. On stream loss it retains the last valid snapshot only during a brief reconnect window and stops leader-owned work. Nstance-server remains inaccessible from the public network, and no proxy configuration is persisted.
 
 ## Operator registration bootstrap
 
@@ -167,10 +167,11 @@ Normal sleep applies the automatic-sleep guards. `--force` bypasses node-count, 
 ## Implementation areas
 
 - **Nstance operator:** configurable Kubernetes eligibility, Job/CronJob evaluation, wake deadlines, all-shard sleep ordering, and post-wake MachinePool restoration.
-- **Nstance server:** durable per-tenant shard state, timers, final busy check, and local reconciliation.
+- **Nstance server:** durable per-tenant shard state, timers, final busy check, local reconciliation, and narrow proxy/supervisor Unix gRPC control streams.
+- **Nstance tunnel supervisor:** least-privileged local wake-tunnel lifecycle, readiness/failure status, restart/backoff, and stream-loss cleanup.
 - **Nstance agent:** read-only pinned-map collection and eBPF counter/error reporting.
-- **vmconfig:** optional `knc`/`knd` BPF accounting, bpftool oneshot loader, pin permissions, `knc`/`nst` tunnel services, `nst` kind, optional `nstance-proxy`, and secret receive watchers.
+- **vmconfig:** optional `knc`/`knd` BPF accounting, bpftool oneshot loader, pin permissions, intrinsic production `knc` tunnels, `nst` kind, installation/configuration/hardening of optional `nstance-proxy` and `nstance-tunnel`, tunnel clients, and secret receive watchers.
 - **Podplane CLI:** generated sleep policy and the annotation-based sleep command.
 - **Components:** deploy/configure nstance-operator and the required operator permissions.
 
-Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, durable compensation when a later shard rejects or fails, operator restart during compensation, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, listener-derived port sets including NLB ingress port 80, zero, nonzero, absent, failed, and stale eBPF reports, traffic during production-target draining, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, forced sleep, NAT dependencies, signing-key/seed create-or-adopt after interrupted applies, signing-key reads only during seed creation, lost registration responses, and bootstrap Secret deletion after durable certificate storage.
+Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, durable compensation when a later shard rejects or fails, operator restart during compensation, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, listener-derived port sets including NLB ingress port 80, zero, nonzero, absent, failed, and stale eBPF reports, traffic during production-target draining, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, Unix stream reconnect and snapshot replacement, in-place listener reconciliation, supervisor stream closure, tunnel readiness/failure and process restart/backoff, least privilege, absence of lifecycle state files, forced sleep, NAT dependencies, signing-key/seed create-or-adopt after interrupted applies, signing-key reads only during seed creation, lost registration responses, and bootstrap Secret deletion after durable certificate storage.

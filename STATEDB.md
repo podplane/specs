@@ -1,6 +1,6 @@
 # Shared State Database
 
-> **STATUS**: Draft
+> **STATUS**: Implemented
 
 This document specifies an optional external shared state database for Easy
 OIDC. Its primary purpose is to let multiple Easy OIDC replicas safely serve
@@ -22,9 +22,18 @@ are out of scope.
 
 ## Configuration
 
-When `state_database` is absent, Easy OIDC continues to use
-`data_dir/easy-oidc-state.db`. When present, Easy OIDC stores all protocol state
-in the configured database and does not open the SQLite state file.
+When `state_database` is absent, Easy OIDC uses SQLite at
+`./data/easy-oidc-state.db`. An omitted `state_database.driver` also defaults to
+SQLite, and `state_database.path` may set a different SQLite file:
+
+```jsonc
+"state_database": {
+  "driver": "sqlite",
+  "path": "/var/lib/easy-oidc/easy-oidc-state.db"
+}
+```
+
+PostgreSQL stores protocol state externally and supports multiple replicas:
 
 ```jsonc
 "state_database": {
@@ -38,10 +47,12 @@ in the configured database and does not open the SQLite state file.
 }
 ```
 
-The initial implementation accepts only `driver: postgresql`. The driver field
-is retained so a future MySQL implementation does not require a configuration
-shape change. `max_connections` defaults to `16`; `query_timeout` defaults to
-`5s`. Both must be positive and are validated at startup.
+The implementation accepts `sqlite` and `postgresql`; the driver field leaves
+room for a future MySQL implementation. SQLite accepts only `path`. PostgreSQL
+accepts `connection_string_secret`, `max_connections`, `query_timeout`, and
+`migrations`; the two driver configurations cannot be mixed. PostgreSQL
+`max_connections` defaults to `16` and `query_timeout` defaults to `5s`. Both
+must be positive and are validated at startup.
 
 The connection string is loaded through the configured secrets provider. TLS is
 required except for loopback development. `state_database` and `policy_database`
@@ -134,8 +145,8 @@ to SQLite must use a new empty database.
 
 ## Implementation and Verification Plan
 
-1. Change the default SQLite path to `data_dir/easy-oidc-state.db` with no
-   compatibility lookup or migration of `easy-oidc.db`, then add
+1. Change the default SQLite path to `./data/easy-oidc-state.db` with no compatibility
+   lookup or migration of `easy-oidc.db`, then add
    `state_database` configuration, schema validation, secret loading, and
    PostgreSQL pool lifecycle. Verify PostgreSQL mode opens neither SQLite file.
 2. Define a narrow state-store interface and preserve behavior while separating
