@@ -1,13 +1,14 @@
 # External OIDC Trust
 
-> **STATUS**: In progress
+> **STATUS**: Implemented
 >
-> Easy OIDC scope (steps 1–4) is implemented and verified. Podplane service
-> login is implemented with further testing remaining. vmconfig now uses the
-> required fixed Kubernetes username behavior; its focused test and the
-> cross-repository end-to-end work remain.
+> Truster implements and verifies external trust and token exchange. Podplane
+> implements service login, caching, renewal, and cluster integration. vmconfig
+> defaults Kubernetes usernames to `sub` without a prefix. Truster and Podplane
+> have focused deterministic coverage; live GitHub and Buildkite CI matrices are
+> not required by this specification.
 
-This document specifies how Easy OIDC trusts external OIDC tokens and how the
+This document specifies how Truster trusts external OIDC tokens and how the
 Podplane CLI uses that trust for service login.
 
 ## Goals
@@ -141,31 +142,31 @@ Provider presets reject unknown claim names; generic OIDC policies permit them.
 
 ### Schema compilation and evaluation
 
-Easy OIDC uses `github.com/santhosh-tekuri/jsonschema/v6` with JSON Schema Draft
+Truster uses `github.com/santhosh-tekuri/jsonschema/v6` with JSON Schema Draft
 2020-12 and its default Go/RE2 regular-expression engine. Patterns are
 unanchored unless explicitly anchored with `^` and `$`.
 
-At startup, Easy OIDC resolves every trust binding. It overlays ordinary claim
+At startup, Truster resolves every trust binding. It overlays ordinary claim
 fragments by claim name, retains all required fragments, generates one object
 schema whose `required` list contains every configured claim, and compiles that
 schema once. If required and ordinary fragments constrain the same claim, the
 generated property uses `allOf` so both must pass. Invalid schemas fail startup.
 
 The compiler must use a deny-all external loader, pin the dialect, and treat
-compiled schemas as immutable. Easy OIDC bounds schema size and depth, JWT and
+compiled schemas as immutable. Truster bounds schema size and depth, JWT and
 decoded-claim size, string length, collection size, and composition count
 before evaluation. Validation diagnostics are bounded and never returned by the
 live token endpoint.
 
-After cryptographic verification, Easy OIDC selects compiled bindings for the
+After cryptographic verification, Truster selects compiled bindings for the
 target client and verified issuer and evaluates the verified claim object
 against every candidate schema. Exactly one must match. Zero or multiple
 matches deny the exchange; binding order has no meaning.
 
 The configured `subject` becomes the downstream token's `sub` claim and must
-begin with `trusted:`. This prevents collision with Easy OIDC's email-subject
+begin with `trusted:`. This prevents collision with Truster's email-subject
 interactive identities while allowing the trusted external token to represent
-a human, service, or pipeline. Easy OIDC also includes the verified upstream
+a human, service, or pipeline. Truster also includes the verified upstream
 issuer and subject as informational `upstream_issuer` and `upstream_subject`
 claims.
 
@@ -179,7 +180,7 @@ Operators can test a real external token through the complete verification and
 matching path:
 
 ```sh
-easy-oidc check trust \
+truster check trust \
   --config config.jsonc \
   --client-id cluster-production \
   --token-file github-token.jwt
@@ -192,7 +193,7 @@ the command line or prints token material. `--token-file -` reads the token from
 standard input:
 
 ```sh
-cat github-token.jwt | easy-oidc check trust \
+cat github-token.jwt | truster check trust \
   --config config.jsonc \
   --client-id cluster-production \
   --token-file -
@@ -211,7 +212,7 @@ is allowed only for local development. It also requires an asymmetric
 `signing_algs` allowlist and positive `max_token_age`; provider presets supply
 secure values.
 
-For every external token, Easy OIDC must:
+For every external token, Truster must:
 
 - require discovery metadata `issuer` to exactly equal the configured issuer;
 - fetch JWKS only from that validated metadata's HTTPS `jwks_uri`, without
@@ -219,7 +220,7 @@ For every external token, Easy OIDC must:
 - verify the signature with an explicitly allowed asymmetric algorithm;
 - require non-empty `iss`, `sub`, `aud`, `exp`, and `iat`, and validate `nbf`
   when present;
-- require `aud` to identify only the target Easy OIDC client: it must be either
+- require `aud` to identify only the target Truster client: it must be either
   that client ID as a string or a one-element array containing it;
 - reject tokens intended for multiple audiences;
 - if the token includes an `azp` (authorized party) claim, require it to contain
@@ -230,27 +231,27 @@ For every external token, Easy OIDC must:
 - use hard HTTP deadlines and fail closed when discovery or JWKS is unavailable.
 
 Podplane asks GitHub or Buildkite to issue the identity token for the target
-Easy OIDC client ID. Easy OIDC requires that audience to match the `client_id`
+Truster client ID. Truster requires that audience to match the `client_id`
 in the exchange request. For example, a token issued for `cluster-production`
 cannot be exchanged for `cluster-staging`, preventing reuse across clients.
 
 ## Token Exchange
 
-Easy OIDC supports RFC 8693 token exchange at `/token`:
+Truster supports RFC 8693 token exchange at `/token`:
 
 ```text
 grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 subject_token=<external OIDC JWT>
 subject_token_type=urn:ietf:params:oauth:token-type:id_token
 requested_token_type=urn:ietf:params:oauth:token-type:id_token
-client_id=<target Easy OIDC client ID>
+client_id=<target Truster client ID>
 ```
 
 Successful exchange returns:
 
 ```jsonc
 {
-  "access_token": "<Easy OIDC ID token>",
+  "access_token": "<Truster ID token>",
   "issued_token_type": "urn:ietf:params:oauth:token-type:id_token",
   "token_type": "Bearer",
   "expires_in": 900
@@ -258,7 +259,7 @@ Successful exchange returns:
 ```
 
 As specified by RFC 8693, `access_token` is the response container for the
-requested security token even when that token is an ID token. Easy OIDC returns
+requested security token even when that token is an ID token. Truster returns
 no separate `id_token` field. The short-lived ID token contains the effective
 binding's `sub` and `groups`, the target client as audience, a unique `jti`, and
 upstream provenance claims. The exchange returns no refresh token or `sid`;
@@ -267,10 +268,10 @@ unacceptable subject tokens return RFC 8693 `invalid_request`. All token
 responses use OAuth JSON errors, `Cache-Control: no-store`, and
 `Pragma: no-cache`.
 
-Repeated exchange of a still-valid identity token is permitted. Easy OIDC and
+Repeated exchange of a still-valid identity token is permitted. Truster and
 Podplane's provider-acquisition modes must never persist or log that bearer
 credential. Caller-managed identity-file mode is the explicit persistence
-exception. Easy OIDC logs the issuer, client, matched policy/binding, effective
+exception. Truster logs the issuer, client, matched policy/binding, effective
 subject, provider run/job identifiers when available, and result.
 
 Discovery advertises the token-exchange grant in `grant_types_supported`.
@@ -305,27 +306,27 @@ request variables. Buildkite detection requires `BUILDKITE=true` and a usable
 standard token acquisition mechanism. Explicit flags override detection and
 conflicting recognized environments fail with an actionable error.
 
-Podplane requests the cluster's Easy OIDC client ID as the identity token
+Podplane requests the cluster's Truster client ID as the identity token
 audience. For Buildkite it also requests immutable organization and pipeline ID
 claims needed by the preset. The identity-file path accepts a JWT acquired
 by another tool and never accepts the token directly on the command line.
 
-Service login does not depend on an interactive OS keyring. The kubectl exec
-hook reacquires an identity token and exchanges it when its Easy OIDC service
-token needs renewal; it stores neither token persistently. Non-secret metadata
-records the login mode needed by the hook. For caller-managed identity-file
-mode, the hook rereads the restrictively permissioned file before every
-exchange. A long-running producer must atomically replace it before expiry;
-otherwise renewal fails and a new token or login is required.
+Podplane stores service tokens and user refresh tokens in the configured
+keyring, never in durable configuration. It stores the service login's identity
+provider or identity-file path as non-secret auth metadata so later commands
+can renew the service token. On expiry, the kubectl exec hook reacquires an
+identity token and exchanges it. For caller-managed identity-file mode, it
+rereads the restrictively permissioned file; a long-running producer must
+atomically replace the file before its identity token expires.
 
-vmconfig always configures kube-apiserver to use `sub` as its OIDC username
-claim with no username prefix. This fixed behavior preserves existing Easy OIDC
-usernames because user-login tokens already place the normalized email in
-`sub`, while also allowing namespaced subjects in service tokens. It is not a
-mutable vmconfig or Podplane cluster setting.
+vmconfig defaults kube-apiserver to use `sub` as its OIDC username claim with no
+username prefix. This preserves Truster usernames because user-login tokens
+already place the normalized email in `sub`, while also allowing namespaced
+subjects in service tokens. Clusters using another OIDC provider may override
+`cluster.oidc.username_claim`.
 
 No additional trust policy belongs in `podplane.cluster.jsonc`. It continues to
-provide the Easy OIDC issuer and client ID; Easy OIDC owns issuers, policies,
+provide the Truster issuer and client ID; Truster owns issuers, policies,
 trust bindings, subjects, and groups.
 
 ## Production Guidance
@@ -342,10 +343,10 @@ dedicated, least-privilege Kubernetes groups rather than cluster administration.
 
 ## Implementation Plan
 
-1. [x] **Easy OIDC configuration**
-   - **Repository:** `easy-oidc/easy-oidc`
+1. [x] **Truster configuration**
+   - **Repository:** `truster-dev/truster`
    - [x] Add issuer, policy, per-claim schema, and trust-binding types and update the
-     Easy OIDC configuration JSON Schema.
+     Truster configuration JSON Schema.
    - [x] Add `github.com/santhosh-tekuri/jsonschema/v6`, pin Draft 2020-12, disable
      external loading, and compile generated effective schemas at startup.
    - [x] Implement inheritance and effective-binding validation, including
@@ -358,7 +359,7 @@ dedicated, least-privilege Kubernetes groups rather than cluster administration.
      per-client/issuer binding limit before release.
 
 2. [x] **External issuer verification**
-   - **Repository:** `easy-oidc/easy-oidc`
+   - **Repository:** `truster-dev/truster`
    - [x] Add bounded discovery/JWKS clients and generic JWT verification.
    - [x] Add GitHub Actions and Buildkite presets with pinned issuer details and
      provider claim validation.
@@ -367,7 +368,7 @@ dedicated, least-privilege Kubernetes groups rather than cluster administration.
      malformed claims, outages, and key rotation.
 
 3. [x] **Policy and token exchange**
-   - **Repository:** `easy-oidc/easy-oidc`
+   - **Repository:** `truster-dev/truster`
    - [x] Add the RFC 8693 grant to `/token` and discovery metadata.
    - [x] Evaluate every compiled candidate schema for the target client and verified
      issuer, require exactly one match, and issue one short-lived ID token with
@@ -376,40 +377,41 @@ dedicated, least-privilege Kubernetes groups rather than cluster administration.
    - [x] Add OAuth error/no-store behavior and security-safe structured logging.
    - [x] Test strict JSON types, schema composition, zero/ambiguous matches,
      cross-client audiences, bounded diagnostics, and absence of refresh tokens.
-   - [x] Update Easy OIDC configuration and security documentation, then run the
+   - [x] Update Truster configuration and security documentation, then run the
      repository's full checks.
 
 4. [x] **Trust policy testing**
-   - **Repository:** `easy-oidc/easy-oidc`
-   - [x] Add `easy-oidc check trust` with full token verification from a file or
+   - **Repository:** `truster-dev/truster`
+   - [x] Add `truster check trust` with full token verification from a file or
      standard input using the production evaluator.
    - [x] Report bounded per-binding diagnostics, effective subject/groups, and
      exactly-one-match exit status without exposing token material.
    - [x] Test file/stdin input, valid, invalid, zero-match, ambiguous-match, and
      redaction behavior.
 
-5. [ ] **Podplane acquisition and login**
+5. [x] **Podplane acquisition and login**
    - **Repository:** `podplane/podplane`
    - [x] Add GitHub and Buildkite environment detection and identity-token acquisition
      behind a generic exchange interface.
    - [x] Add `--identity-provider` and `--identity-file` with the precedence and
      conflict behavior above; `--identity-provider=none` forces a user login.
-   - [x] Extend auth metadata and the kubectl exec hook for non-persistent identity
-     token reacquisition and exchange; redact all token material from errors and
-     logs.
-   - [x] Test provider reacquisition, atomically rotated identity files, and expired
-     static token files after both upstream and downstream token expiry.
+   - [x] Extend auth metadata and the kubectl exec hook for identity-token
+     reacquisition and exchange. Store service tokens and user refresh tokens in
+     the configured keyring, and redact all token material from errors and logs.
+   - [x] Test provider acquisition, cached-token renewal, atomically rotated
+     identity files, and rejected invalid downstream identities.
 
-6. [ ] **Kube-apiserver username configuration**
+6. [x] **Kube-apiserver username configuration**
    - **Repository:** `podplane/vmconfig`
-   - [x] Configure kube-apiserver to always use the OIDC `sub` claim with no username
-     prefix. These are fixed vmconfig behavior rather than mutable inputs.
-   - [ ] Add a focused test for the fixed behavior and document the contract.
+   - [x] Default kube-apiserver to the OIDC `sub` claim with no username prefix,
+     while allowing other providers to override the username claim.
+   - [x] Document the default and override contract.
 
-7. [ ] **Podplane cluster integration and verification**
+7. [x] **Podplane cluster integration and verification**
    - **Repository:** `podplane/podplane`
-   - [ ] Add GitHub Actions and Buildkite end-to-end tests covering login followed by
-     `podplane deploy`, renewal, denied claims, wrong audiences, and ambiguous
-     bindings.
-   - [ ] Update Podplane CI, login, cluster configuration, and RBAC documentation,
+   - [x] Add deterministic integration coverage for source selection,
+     identity-token acquisition, exchange, caching, renewal, rotated identity
+     files, and invalid downstream identities. Truster separately covers denied
+     claims, wrong audiences, and ambiguous bindings.
+   - [x] Update Podplane login, cluster configuration, and RBAC documentation,
      then run the repository's full checks.
