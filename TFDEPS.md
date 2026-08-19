@@ -1,6 +1,6 @@
 # Terraform Dependencies Cache
 
-> **STATUS**: Draft
+> **STATUS**: Implemented
 
 ## Goal
 
@@ -24,15 +24,17 @@ The command:
 4. normalizes the downloaded Nstance source into Podplane's dependency cache; and
 5. retains the resolved provider lock information needed by later deployments.
 
-The cache contains provider filesystem-mirror data and normalized module source under `deps/tf/`. Podplane does not retain the temporary `.terraform` tree.
+The shared cache contains provider filesystem-mirror data and versioned normalized module source under the `tf/` subdirectory of the configured Podplane dependency cache (normally the XDG cache location or `~/.podplane/cache/deps/tf/`). Downloads are additive: existing provider packages and normalized module versions remain available when newer versions are downloaded. Podplane does not retain the temporary `.terraform` tree.
 
 ## Terraform Generation
 
-Provider and module source/version strings move to constants in `internal/tfgen/cluster.go`. A small shared helper renders provider requirements for both normal cluster generation and the temporary dependency root. Synthetic module blocks may remain separate from config-dependent cluster module blocks.
+Provider and module source/version strings move to constants in `internal/tfgen/cluster.go`. A small shared helper renders provider requirements for both cluster generation and the temporary dependency root. Synthetic registry module blocks remain separate from config-dependent local cluster module blocks.
 
-Normal `tfgen` output remains unchanged: registry module sources and existing golden `.expected.tf` files continue to support ordinary and manual testing. An explicit cached-dependencies mode, such as `cluster create --tf-deps`, instead materializes cached Nstance modules into a managed directory beside the generated files and emits relative local module sources without `version` attributes.
+Generated cluster output always emits relative local module sources pointing to the exact resolved Nstance version in the shared cache, without `version` attributes. Registry module sources are used only by the temporary dependency-resolution root. The version embedded in each generated cluster's module path is its module-version record; no separate dependency manifest is maintained.
 
-Cached-dependencies mode changes only module source paths. Generated provider addresses remain unchanged, while OpenTofu/Terraform CLI configuration directs provider installation to the cached filesystem mirror and disables direct registry downloads.
+Generated provider addresses remain unchanged. One OpenTofu/Terraform CLI configuration in the shared dependency cache directs provider installation to the cached filesystem mirror and disables direct registry downloads. Each cluster directory retains its own provider lock file, so clusters using different provider versions can share the additive mirror safely. When rerunning an existing cluster, Podplane reads the module version from the generated source path and provider versions from `.terraform.lock.hcl`; if any exact package is absent from the shared cache, it retrieves that package automatically while registry access is available without changing the cluster's versions.
+
+`podplane cluster upgrade` is the explicit version-changing workflow for an existing cluster. It downloads the latest module and provider versions allowed by Podplane's constraints, adds them to the shared cache, updates the generated module paths and cluster provider lock, regenerates managed Terraform files, and asks before applying. `--no-apply` performs the download and file updates without applying. The ordinary `cluster create` path remains restorative and never silently upgrades an existing stack.
 
 ## CI Usage
 
@@ -41,9 +43,9 @@ A CI job can:
 1. select exact Podplane and OpenTofu/Terraform versions;
 2. run `podplane deps tf --platform <target-platform>` while online;
 3. persist or package the provider mirror, normalized modules, and lock information for later jobs; and
-4. verify `cluster create --no-apply --tf-deps`, `init`, and `plan` with public registry access blocked.
+4. verify `cluster create --no-apply`, `init`, and `plan` with public registry access blocked.
 
-Runtime cluster directories use copied local module source and the provider filesystem mirror. They never reuse a preinitialized `.terraform` directory.
+Runtime cluster directories reference exact versioned module source and the provider filesystem mirror in the shared dependency cache. They retain only their provider lock file, and never copy dependency packages, duplicate the shared CLI configuration, or reuse a preinitialized `.terraform` directory.
 
 ## Non-goals
 
