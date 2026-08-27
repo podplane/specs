@@ -1,6 +1,6 @@
 # Source Gateway
 
-> **STATUS**: Ready for implementation
+> **STATUS**: Implemented
 
 Source Gateway is a new sub-project of Podplane designed to run on any Kubernetes cluster:
 
@@ -26,16 +26,26 @@ Source Gateway is a new sub-project of Podplane designed to run on any Kubernete
 
 ## Deployment requirements
 
-Secrets Store CSI Driver must mount all static secret material. Source Gateway
-requires `<credentialsDirectory>/encryption-key`, containing the standard
-base64 encoding of 32 random bytes, and fails startup if it is absent or
+Kubernetes 1.37 is the deployment baseline. Secrets Store CSI volumes with
+automatic rotation are preferred for static secret material; native Kubernetes
+Secrets mounted as volumes are also supported. Both use mode `0400`. Clusters
+using native Secrets should enable encryption at rest because their contents are
+stored in etcd.
+
+Source Gateway requires `<credentialsDirectory>/encryption-key`, containing the
+standard base64 encoding of 32 random bytes, and fails startup if it is absent or
 invalid. `encryption-key` is reserved and cannot be a source credential name.
-The initial release reserves this key for encrypted OAuth token storage so a future
-upgrade needs no new secret mount.
+The initial release reserves this key for encrypted OAuth token storage so a
+future upgrade needs no new secret mount.
+
+The chart runs UID 0 inside a private Pod user namespace (`hostUsers: false`),
+where it maps to a unique unprivileged host UID. This allows direct, rotating
+`0400` secret mounts without a privileged copying sidecar. Eligible Linux nodes
+must support Pod user namespaces and idmapped mounts.
 
 ## Architecture
 
-The initial deployment is one controller/data-plane replica with one persistent
+The initial deployment is one controller/proxy replica with one persistent
 volume. Git mirrors and object-cache data are reconstructable; upstreams remain
 authoritative.
 
@@ -102,22 +112,23 @@ as `sourcegateway --config=/etc/sourcegateway/config.jsonc`:
 {
   "tokenAudience": "sourcegateway.dev",
   "objectCacheCapacity": "20Gi",
+  "maxObjectSize": "15Mi",
   "credentialsDirectory": "/var/run/sourcegateway/secrets",
   "githubUserAnnotation": "sourcegateway.dev/github-user",
   "credentials": {
     "gitRepository": {
-      "application-github": {
+      "example-github": {
         "kind": "githubApp",
         "namespaces": ["agents"]
       }
     },
     "objectStorageBucket": {
-      "artifacts": {
-        "kind": "awsStatic",
+      "example-aws": {
+        "kind": "awsAccessKey",
         "namespaces": ["agents", "builds"]
       },
-      "cluster-aws": {
-        "kind": "awsAmbient",
+      "example-gcs": {
+        "kind": "gcsDefault",
         "namespaces": ["agents"]
       }
     }
@@ -128,21 +139,29 @@ as `sourcegateway --config=/etc/sourcegateway/config.jsonc`:
 Each resource selects a credential from its matching group. `namespaces`
 restricts which resource namespaces may select it, including ambient
 credentials. `["*"]` explicitly allows all namespaces; an empty list is invalid.
-Targets remain solely in the resources, while upstream permissions provide the
-final access boundary.
+Each credential may declare one trusted `origin`. GitHub credentials default to
+`https://github.com`, GCS credentials default to
+`https://storage.googleapis.com`, and AWS credentials default to the regional S3
+dual-stack origin resolved by the AWS SDK. Explicit origins support GitHub
+Enterprise Server and custom S3 services. A selected resource cannot send the
+credential elsewhere. Git resources provide the complete repository URL on the
+effective origin. Object resources may omit `spec.backend.endpoint` or provide
+an object storage API base URL, including a path, on that effective origin.
 
-Secret files are mounted read-only through Secrets Store CSI Driver at
+Secret files are mounted read-only at
 `<credentialsDirectory>/<credential-name>`. The default directory is
 `/var/run/sourcegateway/secrets`; operators may change it to match an existing
-mount convention. Runtime config never lives there. Multiple
-`SecretProviderClass` mounts are supported. Ambient credentials require no
-files. Source Gateway rejects escaping symlinks and files accessible to group or
-others, and reloads files after CSI rotation.
+mount convention. Runtime config never lives there. Multiple Secrets Store CSI
+or native Secret volumes are supported. Default-chain credentials require no
+files. Source Gateway confines paths, requires private regular files, opens each
+file only once, and reads related files from one Kubernetes atomic-writer
+generation so rotation cannot mix credentials.
 
-Chart values add a `secretProviderClass` to the encryption key and each
-file-backed credential. The chart renders the JSONC ConfigMap and CSI mounts,
-but omits these deployment-only fields from runtime config. It rolls the
-Deployment when config or mounts change. JSONC is converted with
+Chart values select exactly one `secretProviderClass` or `secretName` for the
+encryption key, serving TLS, and each file-backed credential. The chart renders
+the JSONC ConfigMap and mounts, but omits these deployment-only fields from
+runtime config. It rolls the Deployment when config or mount selection changes.
+JSONC is converted with
 `github.com/tailscale/hujson`, then decoded strictly with Go's JSON library.
 
 Git upstreams initially support HTTPS GitHub.com and GitHub Enterprise Server:
@@ -154,15 +173,15 @@ Git upstreams initially support HTTPS GitHub.com and GitHub Enterprise Server:
 
 SSH and non-GitHub Git servers are out of scope.
 
-AWS S3 authentication supports:
+S3 authentication supports:
 
-- `awsAmbient`, using the Pod's AWS credential chain, including kube2iam; or
-- `awsStatic`, containing `access-key-id`, `secret-access-key`, and optional
+- `awsDefault`, using the AWS SDK default credential provider chain; or
+- `awsAccessKey`, containing `access-key-id`, `secret-access-key`, and optional
   `session-token` files.
 
 GCS authentication supports:
 
-- `gcsAmbient`, using Application Default Credentials; or
+- `gcsDefault`, using Google Application Default Credentials; or
 - `gcsServiceAccount`, containing `service-account.json`.
 
 ## Kubernetes API
@@ -193,7 +212,7 @@ metadata:
 spec:
   upstream:
     url: https://github.com/acme/application.git
-    credential: application-github
+    credential: example-github
   mirror:
     refreshInterval: 1m
     maxStaleness: 10m
@@ -223,10 +242,9 @@ metadata:
 spec:
   backend:
     provider: s3
-    endpoint: https://s3.us-east-1.amazonaws.com
     region: us-east-1
     bucket: acme-agent-artifacts
-    credential: artifacts
+    credential: example-aws
   cache:
     capacity: 20Gi
     ttl: 15m
@@ -237,9 +255,12 @@ spec:
         allow: request.key.startsWith("workspaces/" + sa.name + "/")
 ```
 
-S3 `region` is required and passed only to the upstream client.
-`endpoint` is optional and defaults to the provider endpoint; explicit endpoints
-must use HTTPS except on loopback. GCS omits `region`.
+S3 `region` is required and selects the default regional dual-stack origin when
+the credential does not declare one. `endpoint` is an optional object storage
+API base URL; its origin must match the selected credential's effective origin,
+while its path is preserved for the provider SDK. HTTPS is required unless the
+process was started with an exact `--allow-insecure-upstream` origin opt-in. GCS
+omits `region`.
 
 Status includes conditions, `policyRevision`, and `bucketName`, generated as:
 
@@ -251,15 +272,16 @@ Periods become hyphens before truncation. `hash` is the first 12 characters of
 the lowercase, unpadded Base32 SHA-256 of `<namespace>/<name>`. The result is
 stable, at most 62 characters, and S3-compatible. Consumers use it with the
 deployment's Service or Ingress URL and path-style addressing. `ListBuckets`
-checks `object.list-buckets` on each ready resource and returns its authorized
+checks `bucket.list` on each ready resource and returns its authorized
 `bucketName`. `CopyObject` is limited to one logical bucket.
 
 The controller recomputes `bucketName` and maps it to the resource in memory;
 status is output only. A collision makes all affected resources unready.
 
-Invalid policy immediately removes a source from serving. Both kinds use the
-`sourcegateway.dev/runtime-cleanup` finalizer. On deletion it removes routes,
-drains requests, and deletes local data, but never upstream data.
+Invalid policy immediately removes a source from serving. Every reconciliation
+builds a complete snapshot; omitted or deleting resources have their routes
+drained before Source Gateway removes reconstructable local data. No finalizer
+or parent-resource writes are required, and upstream data is never deleted.
 
 ## CEL authorization
 
@@ -269,15 +291,16 @@ match or any compilation, evaluation, timeout, or cost failure denies.
 Operations are:
 
 ```text
-git.read                 object.list-buckets
-git.push                 object.head-bucket
+git.read                 bucket.list
+git.push                 bucket.head
                          object.list
                          object.read
                          object.write
                          object.delete
 ```
 
-The versioned, strongly typed environment contains only:
+Git and object policies compile against distinct strongly typed request
+environments. Fields from the other domain are rejected. Together they contain:
 
 ```text
 sa.namespace         string
@@ -304,8 +327,16 @@ Source Gateway implements smart HTTP discovery, `git-upload-pack`, and
 `git-receive-pack`. Dumb HTTP, cookies, and SSH are unsupported.
 
 Discovery and upload-pack each authorize `git.read`. Reads are repository-wide.
-A mirror older than `maxStaleness` returns `503`; refreshes never expose partial
-state.
+Refreshes never expose partial state. If a refresh fails, Source Gateway may
+continue serving the previous mirror until `maxStaleness` only when the upstream
+URL is unchanged and no repair marker exists. An older mirror returns `503`.
+Successful pushes through Source Gateway update the mirror immediately, so this
+bound mainly covers changes made directly upstream.
+
+Each installed mirror records its exact upstream URL and refresh time. Startup
+validates bare Git structure and metadata, recovers the best complete destination,
+backup, or temporary clone left by an interrupted atomic swap, and reinstalls the
+controlled receive hook. Candidates from another origin are never reused.
 
 Pushes accept only `refs/heads/*`. Each ref command authorizes `git.push`; one
 denial rejects the whole push before upstream access.
@@ -315,9 +346,14 @@ or force-updates the branch. Non-commit targets, malformed commands, missing
 objects, and stale old object IDs reject the push.
 
 Objects are unpacked into quarantine. Source Gateway validates the complete
-push before sending it to GitHub. Serving refs change only after GitHub accepts.
-If local update then fails, the client still receives success, reads stop, and
-an immediate refresh repairs the mirror.
+push before sending it to GitHub with atomic per-ref leases. Serving refs change
+only after GitHub accepts. If the push command fails after dispatch, Source
+Gateway queries every affected upstream ref. It reports success only when the
+complete requested final state is visible; otherwise it reports that the push
+outcome is unknown, marks the mirror for repair, and tells the caller to inspect
+the upstream before retrying. If only the local ref update fails after a confirmed
+commit, the client still receives success and an immediate refresh repairs the
+mirror.
 
 ## Future: GitHub user impersonation
 
@@ -361,8 +397,8 @@ bearer header. SigV4 and presigned URLs are unsupported.
 
 | Operation | Authorization |
 | --- | --- |
-| `ListBuckets` | `object.list-buckets` |
-| `HeadBucket` | `object.head-bucket` |
+| `ListBuckets` | `bucket.list` |
+| `HeadBucket` | `bucket.head` |
 | `ListObjectsV2` | `object.list` on the prefix |
 | `HeadObject`, `GetObject` | `object.read` |
 | `PutObject` | `object.write` |
@@ -373,27 +409,47 @@ Initial limits:
 
 - 1,000 list or multi-delete entries;
 - one byte range;
-- 15 MiB writes and copies;
-- required `Content-Length` and precomputed checksums;
-- no chunking, trailers, or `Expect: 100-continue`; and
+- a configurable maximum object size, defaulting to 15 MiB for Nono
+  interoperability; `null` removes the gateway size limit;
+- fixed-length, HTTP chunked, and S3 `aws-chunked` uploads;
+- supported SHA-256, MD5, CRC32, and CRC32C request checksums in headers or
+  trailers, when supplied; and
 - ASCII keys of 1–1,024 bytes matching `[A-Za-z0-9][A-Za-z0-9._/-]*`, excluding
   empty, `.` and `..` segments.
 
-Multipart, multiple ranges, ACLs, versioning, Object Lock, browser uploads,
-S3 Select, notifications, virtual-host buckets, and bucket mutation are out of
-scope.
+Multipart upload, multi-object delete, server-side copy, conditional writes, and
+`Expect: 100-continue` are supported. Multiple ranges, ACLs, versioning, Object
+Lock, browser uploads, S3 Select, notifications, virtual-host buckets, and bucket
+mutation are out of scope.
 
 ETags, checksums, and generations are opaque. Preconditions use provider-native
 atomic conditions or fail without writing.
 
 Authorization precedes cache access. Data becomes visible only after a complete
 validated read or committed write. Failed transfers leave no partial entry.
-Writes acknowledge only after backend commit. Lists always query the provider.
+Writes acknowledge only after backend commit. Operations touching the same key,
+including both ends of a copy, are serialized so cache effects cannot overtake
+upstream effects. Lists always query the provider.
+
+When a mutation fails after dispatch without a definitive provider rejection,
+Source Gateway evicts the affected cache entry and returns HTTP `409` with S3
+code `OperationOutcomeUnknown`, without `Retry-After`. The caller must inspect
+the authoritative upstream before retrying. Multi-delete reports this per key;
+an indeterminate multipart completion consumes the local upload.
 
 Deployment setting `objectCacheCapacity` sets the global object-cache limit.
 `cache.capacity` is a per-resource maximum, not reserved space. Evict the least
 recently used objects to enforce both limits and keep 10% of the volume free.
-Return `507` before changing upstream data when space is unavailable.
+Cache admission is best-effort and never blocks an authoritative write solely
+because the cache is full. Required staging can return `507` before upstream
+mutation when local temporary storage is unavailable. With a finite size limit,
+ordinary uploads are staged and fully size/checksum validated before dispatch;
+with no limit, a fixed-length upload without a checksum streams directly while
+chunked, checksummed, and multipart data remains staged.
+
+Cache metadata stores a SHA-256 digest calculated during admission. Startup reads
+each cached file once to verify its digest, size, and bucket/key identity, and
+discards any mismatch. Runtime cache hits avoid an extra hashing pass.
 
 ## Security and operations
 
@@ -403,19 +459,27 @@ headers, 30 seconds for provider API calls, 2 minutes for object transfers, and
 10 minutes for Git transfers. Return `504` only if nothing committed.
 
 - TLS protects every non-loopback hop.
-- The deployment mounts its serving certificate and key through CSI;
-  cert-manager is not required.
+- The deployment mounts its serving certificate and key from CSI or a native
+  Secret. `controller-runtime/pkg/certwatcher` loads it once and updates the
+  in-memory certificate after rotation; cert-manager is not required.
+- The chart's Service exposes only application TLS on 443. TLS health and metrics
+  use Pod port 9443. Operators may use a `PodMonitor` or create their own metrics
+  Service, with separate NetworkPolicy ingress selectors.
 - The chart provides an ingress NetworkPolicy. Operators manage provider egress
   because standard NetworkPolicy cannot match DNS names.
 - Upstream TLS verification is mandatory; cross-origin redirects are rejected.
 - Policy denial returns `403`; unavailable providers return `503` only when no
   operation committed.
-- Credentials, provider topology, URLs, branches, keys, and content are redacted
-  from status, errors, logs, metrics, and audit events.
+- Credentials, provider endpoints and topology, upstream URLs, branches, object
+  keys, and content are redacted from status, errors, logs, metrics, and audit
+  events. Metrics retain logical resource namespace/name and derived bucket
+  labels so operators can identify the affected source.
 - Audits record ServiceAccount, source, operation, policy revision, decision,
   reason, and matched rules.
-- Startup validates mirrors and discards incomplete cache entries. Volume loss
-  rebuilds local state without replaying writes.
+- RBAC permits TokenReview creation, list/watch of source resources, and status
+  updates; the controller does not write parent resources or finalizers.
+- Startup recovers complete mirror swaps and discards incomplete or corrupt cache
+  entries. Volume loss rebuilds local state without replaying writes.
 
 Readiness requires Kubernetes API access, serving TLS, writable storage, and a
 published runtime snapshot. Individual source failures do not disable healthy
@@ -432,7 +496,8 @@ all acknowledged writes exist there.
 `github.com/sourcegateway/sourcegateway` owns the binary, API, Helm chart,
 provider adapters, documentation, and tests.
 
-Pin tools and dependencies in the repository, and document tested versions with
+Pin Go dependencies in the repository. Mise installs versioned external tools
+and records resolved artifacts in its lockfile. Document tested versions with
 each release.
 
 Implementation order:
@@ -464,9 +529,10 @@ verifies Git clone, fetch, allowed push, and denied push, plus S3 put, get, list
 delete, and CEL denial against SeaweedFS using rclone and an AWS SDK. It excludes
 live GitHub authentication, GCS, CSI, PVC, and NetworkPolicy behavior.
 
-Other tests cover CRDs and status, finalizers, credentials, tokens, CEL limits,
-redaction, cache recovery, and provider failures. Completion requires all tests,
-the offline end-to-end test, and Helm lint and template validation to pass.
+Other tests cover CRDs and status, credentials and rotation, tokens, CEL limits,
+redaction, mirror and cache recovery, ambiguous mutations, and provider failures.
+Completion requires all tests, the offline end-to-end test, and Helm lint and
+template validation to pass.
 
 Direct downstream authentication must work without Nono. Separate optional-Nono
 tests verify confinement, proxy-only access, and token rotation.
