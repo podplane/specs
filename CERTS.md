@@ -1,6 +1,13 @@
 # Podplane Workload Certificates
 
-> **STATUS**: In progress
+> **STATUS**: In review
+>
+> The cross-repository implementation is substantially complete. Remaining work:
+> align Seedgen expectations and regenerate the recommended seed without obsolete
+> cert-manager/Secret-based certificate resources; add the prescribed operational
+> alerts; and complete the Kubernetes 1.37 provider, projection, rotation, mTLS,
+> Service-identity, Envoy Gateway, delayed-install, and private-material acceptance
+> matrix before declaring the contract implemented.
 
 This specification builds on [Kubernetes KEP-4317: Pod Certificates](https://github.com/kubernetes/enhancements/tree/master/keps/sig-auth/4317-pod-certificates), [KEP-3257: ClusterTrustBundles](https://github.com/kubernetes/enhancements/tree/master/keps/sig-auth/3257-cluster-trust-bundles), the [ClusterTrustBundle documentation](https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/#cluster-trust-bundles), and the SPIFFE [ID](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE-ID.md) and [X.509-SVID](https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md) specifications.
 

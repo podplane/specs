@@ -2,7 +2,10 @@
 
 > **STATUS**: In review
 >
-> Remaining work: cloud-provider testing/verification
+> The implementation is complete and the local CLI-to-CSI path works. Remaining
+> review covers practical AWS backend and CSI verification, equivalent GCP and
+> production Vault/OpenBao verification where practical, and the required API,
+> CLI, admission-policy, and lifecycle acceptance matrix.
 
 ## Goals
 
@@ -1229,7 +1232,7 @@ Local fakevault requirements:
 
 - Expose a Vault/OpenBao-compatible HTTPS API under the Podplane local server, scoped by cluster ID, for example `/vault/<cluster-id>/v1/...`.
 - Store local secret values in the host OS keychain/keyring, scoped by cluster ID and backend path.
-- Support the minimal KV-v2 and auth API surface needed by the OpenBao/Vault CSI provider, the `bao` CLI compatibility test, and the future operator Vault/OpenBao adapter.
+- Support the minimal KV-v2 and auth API surface needed by the OpenBao/Vault CSI provider, the `bao` CLI compatibility test, and the operator Vault/OpenBao adapter.
 - Implement KV-v2-lite soft delete semantics rather than a full Vault/OpenBao version-history engine. This keeps production operator/provider logic clean while giving local clusters the same user-facing `delete`, `restore`, `destroy`, and `list` behavior.
 - Authenticate login requests with Kubernetes service-account JWTs from the target local cluster.
 - Validate service-account JWTs against the local kube-apiserver JWKS endpoint. If the JWKS endpoint is not anonymous-readable, fakevault may use the submitted service-account JWT as the bearer token to fetch JWKS, then verify that same JWT locally.
@@ -1246,7 +1249,12 @@ KV-v2-lite fakevault behavior should be intentionally narrow:
 - List includes archived paths with enough metadata for the operator to report `status: archived`; destroyed paths are not listed.
 - Do not implement multiple historical versions, CAS, per-version deletion arrays, retention windows, or complete Vault metadata responses unless the operator or CSI provider needs a specific field.
 
-Current status: the local fakevault server portion has been implemented in `github.com/podplane/podplane`. It is keyring-backed, mounted by the local server at `/vault/<cluster-id>/v1/...`, supports the minimal KV-v2/auth API exercised by `bao`, and validates login with real local Kubernetes service-account JWTs. The future work is wiring `podplane secret`, `podplane-operator`, and Secrets Store CSI provider end-to-end flows to use it.
+Current status: the complete local path is implemented. The keyring-backed fakevault
+server is mounted at `/vault/<cluster-id>/v1/...`, supports the KV-v2/auth surface
+used by `bao`, the operator adapter, and the CSI provider, and validates real local
+Kubernetes service-account JWTs. `podplane secret` uses the aggregated API through
+kube-apiserver, and values written through that path can be mounted through the
+OpenBao CSI provider. Remaining work is verification rather than local-path wiring.
 
 ## Security considerations
 

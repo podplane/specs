@@ -1,6 +1,13 @@
 # Podplane Ingress Certificates and ACME
 
-> **STATUS**: In progress
+> **STATUS**: In review
+>
+> Issuance, fallback, backend storage, and SDS delivery are substantially
+> implemented. Remaining work: verify Envoy Gateway recognizes the
+> extension-gated pointer and that invalid initial material prevents TLS serving;
+> and prove public Route53 issuance, renewal, fallback, and private-material
+> exclusion from etcd, xDS, control-plane memory, logs, events, and status in an
+> integrated cluster.
 
 Related: [CERTS.md](./CERTS.md), [DOMAINS.md](./DOMAINS.md)
 
@@ -102,7 +109,7 @@ Each Gateway listener references a core Secret in the Gateway namespace. That Se
 
 The private combined PEM bundle remains in the configured external Secrets backend. Secrets Store CSI mounts only the exact per-domain bundle into each Envoy data-plane Pod. A hardened Podplane SDS sidecar in that Pod reads the mount and serves the certificate to the co-located Envoy process over a Pod-local Unix domain socket. The socket is carried on a shared in-memory volume and is inaccessible over the Pod network. The sidecar runs as non-root with a read-only root filesystem, no privilege escalation, all Linux capabilities dropped, and read-only access to the certificate mount; Envoy receives neither external-provider credentials nor direct access to that mount.
 
-The sidecar validates key correspondence, exact apex-and-wildcard SANs, chain signatures, validity, and server-authentication usage before publishing an SDS generation. It watches CSI's atomic mount updates, sends a complete validated generation over SDS, and retains the last-known-good generation across malformed, partial, or temporarily unavailable updates. Envoy hot-reloads successful SDS updates without a data-plane Pod restart. Initial invalid or absent material prevents the sidecar from starting and leaves the listener unready; later failures preserve the prior valid listener and emit bounded diagnostics without certificate or key material.
+The sidecar validates key correspondence, exact apex-and-wildcard SANs, chain signatures, validity, and server-authentication usage before publishing an SDS generation. It detects CSI's atomic mount updates, sends a complete validated generation over SDS, and retains the last-known-good generation across malformed, partial, or temporarily unavailable updates. Envoy hot-reloads successful SDS updates without a data-plane Pod restart. Initial invalid or absent material prevents the sidecar from starting, leaves the SDS socket unavailable, and prevents Envoy from completing TLS handshakes. Envoy Gateway does not observe runtime SDS availability, so Gateway API listener conditions may remain `Programmed`; readiness for this failure is a data-plane serving property rather than a listener-status transition. Later failures preserve the prior valid listener and emit bounded diagnostics without certificate or key material.
 
 The Envoy Gateway control plane sees only the pointer Secret metadata and SDS configuration. Ingress private-key bytes must never enter etcd, xDS resources emitted by the Envoy Gateway control plane, control-plane memory, logs, events, or status. They exist only in the external backend, CSI/provider and node mount path, SDS sidecar memory, the UDS exchange, and Envoy data-plane memory.
 
@@ -132,8 +139,8 @@ The wizard does not ask about ACME server selection, solver details, IAM roles, 
 3. **Implemented in the current work:** persist and read operator-owned state from supported Podplane Secrets backends without exposing reads through the aggregated Secrets API.
 4. **Implemented in the current work:** publish and rotate validated self-signed fallback bundles per domain.
 5. **Implemented in the current work:** use pinned Lego Route53 DNS-01 for ACME account registration, issuance, key rotation, renewal, and failure retention.
-6. **Implemented in the current work:** configure Envoy Gateway 1.9's extension-gated upstream SDS Secret-reference API and metadata-only pointer, per-Pod CSI mount, hardened SDS sidecar, and UDS boundary specified above.
-7. **Implemented in the current work:** validate initial material and hot rotations, retain the last-known-good generation, and leave listeners unready when no valid initial generation exists.
+6. **Implemented in the current work:** configure Envoy Gateway 1.9's extension-gated upstream SDS Secret-reference API and metadata-only pointer, per-Pod CSI mount, hardened SDS sidecar, and memory-backed UDS boundary specified above.
+7. **Implemented and unit-tested in the current work:** validate initial material and hot rotations and retain the last-known-good generation. Integrated verification must still prove extension recognition and that no TLS handshake succeeds when no valid initial generation exists.
 8. **Implemented in the current work:** remove the transitional `platform-acme`/cert-manager ingress path, Kubernetes TLS Secrets, bootstrap hooks, and issuer/certificate resources.
 9. Update user documentation and advance this spec only after the public ingress endpoint serves and renews the externally stored certificate and integrated checks prove private material never enters etcd or the Envoy Gateway control plane.
 

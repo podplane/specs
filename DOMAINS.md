@@ -1,6 +1,12 @@
 # Podplane Cluster Domains
 
 > **STATUS**: In review
+>
+> Most configuration, AWS DNS, and endpoint propagation work is implemented,
+> including `REGISTRY_HOSTNAME` propagation through generated mutable VM
+> configuration. Remaining work: preserve listener-specific pool registration in
+> Google Cloud and complete the shared-AWS, mutable-hostname, kubeconfig, DNS,
+> registry, and advertised-provider acceptance matrix.
 
 ## Goal
 
@@ -84,7 +90,7 @@ Podplane validates the listeners required by higher-level configuration:
 - The Kubernetes API requires `api_port -> 6443` targeting the `control-plane` pool on its selected load balancer.
 - Listener ports must be unique within a load balancer.
 
-When a domain is configured, the cluster-create wizard creates `main` with explicit ingress and Kubernetes API listeners and selects it for the Kubernetes API. Advanced config may define more load balancers and arbitrary listeners.
+When a domain is configured, the cluster-create wizard creates `main` with explicit HTTPS and Kubernetes API listeners and selects it for the Kubernetes API. The wizard creates only the `control-plane` pool so that a size-one cluster remains a single-VM topology; both listeners therefore target `control-plane`. A configuration with a dedicated `ingress` pool must target the HTTPS listener at that pool, as in the example above. Advanced config may define dedicated ingress pools, more load balancers, and arbitrary listeners.
 
 ## DNS records
 
@@ -170,7 +176,7 @@ The wizard asks only:
 3. The optional ACME account email when the selected DNS provider supports ACME.
 4. The Kubernetes API hostname when the domain is left blank.
 
-With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kubernetes.api_load_balancer: "main"`, and a public `main` load balancer with explicit ingress and Kubernetes API listeners. A supplied ACME email also writes `cluster.acme`; leaving it blank keeps self-signed ingress certificates. Without a domain, it writes the supplied API hostname and leaves load-balancer and DNS wiring to the user. The domain may omit its load-balancer reference because it defaults to `main`. Multiple domains, load balancers, and provider-specific advanced settings remain cluster-config edits.
+With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kubernetes.api_load_balancer: "main"`, and a public `main` load balancer with explicit HTTPS and Kubernetes API listeners targeting the wizard's only pool, `control-plane`. This preserves a single-VM topology when the control-plane size is one. A supplied ACME email also writes `cluster.acme`; leaving it blank keeps self-signed ingress certificates. Without a domain, it writes the supplied API hostname and leaves load-balancer and DNS wiring to the user. The domain may omit its load-balancer reference because it defaults to `main`. Dedicated ingress pools, multiple domains, load balancers, and provider-specific advanced settings remain cluster-config edits; when an `ingress` pool is added, the HTTPS listener must be changed to target it.
 
 ## Implementation plan
 
@@ -191,6 +197,7 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kuber
 - Prompt directly for the optional domain rather than asking a separate yes/no question.
 - When entered, treat it as the exact ingress apex and ask for its optional DNS provider.
 - With a domain, write the domain, `k8s.<domain>`, `registry.<domain>`, and `kubernetes.api_load_balancer: "main"` explicitly.
+- Keep both wizard-created listeners on `control-plane` because the wizard creates no separate ingress pool and must support a size-one, single-VM cluster.
 - Without a domain, ask for and write `kubernetes.api_hostname` without managed load-balancer or DNS wiring.
 - For domain-configured clusters, keep registry ingress disabled and the Kubernetes API public by default.
 - Do not expose multiple domains or advanced DNS settings in the wizard.
@@ -230,7 +237,7 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kuber
 ### 7. Verify end-to-end behavior
 
 - Add config parsing, validation, JSON Schema, wizard, Terraform generation, and Netsyseed tests.
-- Cover domainless explicit API hostnames, missing API hostname validation, no managed API load balancer, manual DNS, Route53, multiple domains, multiple load balancers, explicit target-port mappings, missing required listeners, duplicate ports, listener-specific pools, and explicit hostname overrides.
+- Cover domainless explicit API hostnames, missing API hostname validation, no managed API load balancer, manual DNS, Route53, multiple domains, multiple load balancers, explicit target-port mappings, missing required listeners, duplicate ports, the wizard's single-pool topology, dedicated listener-specific pools, and explicit hostname overrides.
 - Include the shared AWS load-balancer/port-6443 scenario as an acceptance test.
 - Verify generated DNS outputs, kubeconfig connectivity, mutable API hostname updates, node-local registry pulls, port-forwarded pushes, and optional registry ingress.
 - Validate/lint generated Terraform for each supported infrastructure/DNS-provider combination before advertising that combination.

@@ -2,8 +2,11 @@
 
 > **STATUS**: In review
 >
-> Remaining work: test optional Docker `/v2` and `/token` routing, conditional Docker
-> login integration, and production identity and ACL verification.
+> The core `podplane push` path works in local clusters. Remaining work: implement
+> and verify optional Docker `/v2` and `/token` routing; verify conditional Docker
+> login; wire the production registry write identity; align default ACLs and legacy
+> hostname migration with this contract; and complete production and integrated
+> push-to-node-pull verification.
 
 ## Goal
 
@@ -17,16 +20,16 @@ podplane deploy web --name example-api --image <registry-hostname>/apps/example-
 ```
 
 The registry bucket remains the single backing store, with two I/O paths:
-- Read path: On each Kubernetes cluster Node, vmconfig configures a Zot Registry service, which only reads from the bucket.
+- Read path: On each Kubernetes cluster Node, vmconfig configures the read-only Podplane Registry service, which reads directly from the bucket.
 - Write path: All writes to the bucket go through an in-cluster Zot Registry component with a Service and a Deployment.
 
 ## Existing contract
 
-- vmconfig configures host-level Zot from `REGISTRY_*` user-data env vars and serves it only on loopback to containerd.
+- vmconfig configures the host-level Podplane Registry from `REGISTRY_*` user-data env vars and serves it only on loopback to containerd.
 - containerd is configured with only `pull` and `resolve` capabilities.
-- host-level Zot access control grants only `read` to `containerd.client`.
-- AWS `cluster create` already creates two registry roles: `registry_read_only` for host-level Zot and `registry_read_write` for the in-cluster registry component.
-- `deps download` already writes Zot-compatible object layout for mirrored dependency images under the registry bucket root.
+- the host-level service exposes no write path.
+- AWS `cluster create` already creates two registry roles: `registry_read_only` for the host-level registry and `registry_read_write` for the in-cluster registry component.
+- `deps download` already writes the registry-compatible object layout for mirrored dependency images under the registry bucket root.
 - local clusters expose a fake S3 `registry` bucket backed by the local registry cache.
 
 Do not add write credentials to vmconfig nodes.
@@ -60,7 +63,7 @@ podplane push
   -> push with direct Authorization: Bearer <id_token>
   -> Zot validates OIDC issuer/audience/groups and applies ACLs
   -> registry object-storage bucket
-  -> node-local vmconfig Zot reads the same objects
+  -> node-local Podplane Registry reads the same objects
   -> containerd pulls <registry-hostname>/<repo>:<tag>
 ```
 
@@ -174,7 +177,9 @@ Add a `zot-registry` component in `podplane/components`:
 - Add `zot-registry` to `platform.components.apps` and to the bootstrap chart's addon list so `bootstrap.install: recommended` and `all` enable it. Adding only the app entry is insufficient because bootstrap now renders recommended/all overrides from `bootstrap.addons.apps`.
 - Workload: Zot configured for push/pull against the existing registry bucket.
 - Service: ClusterIP named `zot-registry`, selected by `podplane push` for port-forward.
-- Dependencies: `platform-certs` for TLS, plus provider identity plumbing for object-store writes.
+- Dependencies: provider identity plumbing for object-store writes. Optional public
+  ingress additionally depends on Envoy Gateway and the operator-owned ingress
+  certificate path from [ACME.md](./ACME.md).
 - Do not add ingress, HTTPRoute, ServiceMonitor, persistence PVCs, or CRDs for the initial version.
 - No CRD chart unless a Zot operator is introduced; do not introduce one for the initial version.
 - Later Docker-compatible ingress support may add optional custom routing for `/v2/...` and `/token`; keep it disabled by default and do not use the upstream Zot chart ingress for that routing.
@@ -195,7 +200,9 @@ Object-storage credentials must not be stored in Helm values. Use cloud workload
 
 `podplane local start --components recommended` (which is the same as `podplane local start`, since `recommended` is the default) installs `zot-registry`.
 
-The in-cluster registry writes to the local fake S3 `registry` bucket. Node-local vmconfig Zot keeps reading that same bucket through `/s3/cache/`, so pushed local images are immediately pullable by pods as `<local-registry-hostname>/apps/<repo>:<tag>`.
+The in-cluster registry writes to the local fake S3 `registry` bucket. The node-local
+Podplane Registry reads that same bucket, so pushed local images are immediately
+pullable by Pods as `<local-registry-hostname>/apps/<repo>:<tag>`.
 
 Minimal local clusters do not install the component; `podplane push` reports that `zot-registry` is missing, suggests how to install it with the `podplane install` command, and exits early.
 
@@ -203,10 +210,11 @@ Minimal local clusters do not install the component; `podplane push` reports tha
 
 AWS `cluster create` wires:
 
-- vmconfig/node Zot: `REGISTRY_ASSUME_ROLE = registry_read_only`.
+- vmconfig/node Podplane Registry: `REGISTRY_ASSUME_ROLE = registry_read_only`.
 - `zot-registry`: `registry_read_write`.
 
-GCP must follow the same split when `cluster create` supports GCP: node-local Zot gets read-only bucket access; `zot-registry` gets write access.
+GCP must follow the same split when `cluster create` supports GCP: the node-local
+Podplane Registry gets read-only bucket access and `zot-registry` gets write access.
 
 ## Image layout
 
@@ -269,7 +277,8 @@ Do not make Zot a transparent pull-through cache.
 
 ### Repository: `github.com/podplane/vmconfig`
 
-Keep node-local Zot read-only. No initial changes unless the new cluster registry config exposes a currently missing `REGISTRY_*` value.
+Keep the node-local Podplane Registry read-only and bound to loopback for containerd.
+Propagate every `REGISTRY_*` value required by its object-store and hostname contract.
 
 ## Security invariants
 
@@ -279,4 +288,4 @@ Keep node-local Zot read-only. No initial changes unless the new cluster registr
 - Stock Docker support requires the token-service adapter; do not claim Docker compatibility without it.
 - Zot authorization is based on OIDC claims and ACLs, with operator-overridable policy.
 - The only bucket writer is the in-cluster registry component.
-- Existing mirrored dependency image layout remains compatible with vmconfig Zot.
+- Existing mirrored dependency image layout remains compatible with the node-local Podplane Registry.
