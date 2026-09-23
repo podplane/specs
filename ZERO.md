@@ -7,7 +7,7 @@
 Scale-to-zero should feel like **Wake-on-LAN for Kubernetes**. Podplane may stop every Kubernetes node, then wake the cluster for:
 
 - an external kube-apiserver request;
-- an external Traefik ingress request;
+- an external Envoy Gateway ingress request;
 - an upcoming CronJob.
 
 Nstance Server VMs remain running by default, normally one per zone/shard. They can use very small instance types because they provide the durable control plane while Kubernetes is asleep.
@@ -71,7 +71,7 @@ The all-shard operation is compensating rather than atomic. If any shard rejects
 
 ## Traffic activity
 
-External kube-apiserver exposure remains direct and never depends on Traefik.
+External kube-apiserver exposure remains direct and never depends on Envoy Gateway.
 
 Each Kubernetes group that can participate in guarded normal sleep uses eBPF to count active TCP connections on every production target port derived from its referenced `load_balancers` listeners. vmconfig configures ingress ports only, kube-apiserver port 6443 only, their union for a group serving both roles, or no accounting for a group serving neither role. Standard NLB ingress therefore counts ports 80 and 443, while tunnel ingress counts port 443. This listener-derived configuration supports shared or separate control-plane and ingress groups without duplicating the port model in role configuration.
 

@@ -4,7 +4,7 @@
 
 ## Goal
 
-Podplane supports two ways to expose both Traefik ingress and kube-apiserver:
+Podplane supports two ways to expose both Envoy Gateway ingress and kube-apiserver:
 
 1. provider Network Load Balancers (NLBs) on AWS and Google Cloud; or
 2. outbound tunnels through a provider-neutral interface, initially supporting only Cloudflare Tunnels.
@@ -15,11 +15,11 @@ Both integrate with scale-to-zero without placing `nstance-proxy` in the normal 
 
 While Kubernetes is awake:
 
-- NLB ports 80 and 443 route directly to Traefik on cluster nodes;
+- NLB ports 80 and 443 route directly to Envoy on cluster nodes;
 - the NLB's configured external API port, defaulting to 6443, routes directly to kube-apiserver port 6443 on control-plane nodes;
-- tunnel processes run on control-plane VMs and use local kube-apiserver and Traefik ports.
+- tunnel processes run on control-plane VMs and use local kube-apiserver and Envoy ports.
 
-Kube-apiserver must not depend on Traefik for ingress, because a broken ingress controller must not lock administrators out of the cluster.
+Kube-apiserver must not depend on Envoy Gateway for ingress, because a broken ingress controller must not lock administrators out of the cluster.
 
 Nstance registers agent-healthy instances with AWS target groups or Google Cloud zonal NEGs and deregisters them before deletion. Registration is ready for cutover only when the provider reports the target healthy and routable, not merely when it accepts the membership change. A bounded readiness timeout aborts the cutover and retains or restores the old path. The load balancer performs ongoing health checks after cutover.
 
@@ -60,7 +60,7 @@ AWS configuration names every target group and its public, production, and proxy
 }
 ```
 
-Terraform creates one regional AWS target group for each exposed listener: Traefik ports 80 and 443 and the configured kube-apiserver listener. The same target-group ARNs are passed to every shard. Shard leaders register and deregister only their local production and proxy targets; target groups are not duplicated per Availability Zone or shard.
+Terraform creates one regional AWS target group for each exposed listener: Envoy ports 80 and 443 and the configured kube-apiserver listener. The same target-group ARNs are passed to every shard. Shard leaders register and deregister only their local production and proxy targets; target groups are not duplicated per Availability Zone or shard.
 
 Google Cloud configuration lists its zonal `GCE_VM_IP` NEGs and passthrough frontends. The list includes every eligible production subnet and the Nstance server subnet without repeating those subnet IDs:
 
@@ -146,7 +146,7 @@ Both processes use the shared `pkg/proxy` configuration structs. Each listener v
 
 `nstance-proxy` waits for the initial listener snapshot before serving, validates each complete replacement, and reconciles listener changes in place without disrupting unchanged listeners. During a brief control-stream disconnect it retains the last valid snapshot while reconnecting, but immediately stops leader-owned work; a prolonged disconnect makes the proxy unavailable rather than extending stale authority. No proxy configuration state is written to disk.
 
-`WakeTenant(listener)` validates the listener, idempotently wakes its tenant, waits for an agent-healthy instance from any configured group and for `target_port` readiness, then returns one private `IP:target_port`. This and the listener stream are the only nstance-proxy-facing operations. `nstance-proxy` understands no provider APIs, Kubernetes, kube-apiserver, or Traefik.
+`WakeTenant(listener)` validates the listener, idempotently wakes its tenant, waits for an agent-healthy instance from any configured group and for `target_port` readiness, then returns one private `IP:target_port`. This and the listener stream are the only nstance-proxy-facing operations. `nstance-proxy` understands no provider APIs, Kubernetes, kube-apiserver, or Envoy Gateway.
 
 Every derived listener is a wake trigger and activity source. Validation rejects cross-tenant references, invalid ports, duplicate Google Cloud destination-IP and port selectors, collisions with nstance-server ports, and any reuse of an AWS or tunnel proxy port, including by a Google listener.
 
@@ -158,7 +158,7 @@ AWS uses one regional target group per listener, shared by all shards and Availa
 
 Enabling cross-zone load balancing requires no cluster-wide coordination because concurrent enable operations are idempotent. The Nstance cluster leader coordinates only its re-disablement: after Kubernetes is awake, production routing has been restored, and proxy targets have been removed in every shard, it disables cross-zone load balancing on all target groups. This decision is serialized against new sleep transitions so the cluster leader cannot disable the setting after a shard has enabled it for sleep. Cross-zone control requires `elasticloadbalancing:ModifyTargetGroupAttributes` scoped to the configured target groups; shard leaders continue to own only their local target membership.
 
-Google Cloud uses `GCE_VM_IP` NEGs instead of unmanaged instance groups because a Compute Engine VM can belong to only one instance group. The same VM interface can be represented as an endpoint in multiple NEGs, and the same NEG can back multiple backend services. This allows one VM—particularly an Nstance proxy—to participate in multiple logical load balancers without coupling their membership. It also permits separate NEGs for Traefik ingress on port 443 and kube-apiserver traffic on port 6443, regardless of whether they are backed by one Nstance group or separate groups.
+Google Cloud uses `GCE_VM_IP` NEGs instead of unmanaged instance groups because a Compute Engine VM can belong to only one instance group. The same VM interface can be represented as an endpoint in multiple NEGs, and the same NEG can back multiple backend services. This allows one VM—particularly an Nstance proxy—to participate in multiple logical load balancers without coupling their membership. It also permits separate NEGs for Envoy ingress on port 443 and kube-apiserver traffic on port 6443, regardless of whether they are backed by one Nstance group or separate groups.
 
 Google Cloud uses a regional external passthrough Network Load Balancer with one `GCE_VM_IP` zonal NEG per logical membership set, zone, and eligible subnet. Terraform attaches all of those NEGs to the logical load balancer's regional backend service; a backend service cannot mix instance groups and NEGs. While awake, Nstance registers each production VM interface with the configured NEG whose discovered subnetwork matches the interface. While asleep, it registers the shard leader's interface with the NEG matching the Nstance server subnet. Google Cloud preserves the forwarding-rule IP and port, so its listener, production, and proxy ports are equal; separate load balancers may reuse that port because their forwarding-rule IPs distinguish tenants.
 
@@ -206,14 +206,14 @@ The tunnel feature contract is provider-neutral, with Cloudflare Tunnel as the i
 
 vmconfig installs the selected tunnel client on both `knc` control-plane VMs and `nst` Nstance Server VMs. Provider-specific vmconfig variants/kinds may package different clients without adding provider logic to Nstance.
 
-Each control-plane VM runs one tunnel process for both kube-apiserver and ingress. `knc` is the VM-level control-plane role. Podplane currently runs Traefik as a host-port DaemonSet on every schedulable node, including control-plane nodes, so the tunnel uses stable local upstreams:
+Each control-plane VM runs one tunnel process for both kube-apiserver and ingress. `knc` is the VM-level control-plane role. Podplane runs Envoy as a host-port DaemonSet on every schedulable node, including control-plane nodes, so the tunnel uses stable local upstreams:
 
 - kube-apiserver on port 6443;
-- Traefik on port 443 when ingress is enabled.
+- Envoy on port 443 when ingress is enabled.
 
-No separate ingress-node role, Traefik sidecar, or live upstream discovery is required. Components must continue scheduling Traefik on control-plane nodes when tunnel ingress is enabled. The tunnel process still runs when ingress is disabled because kube-apiserver remains an endpoint; its configuration simply omits ingress routes.
+No separate ingress-node role or live upstream discovery is required. Components must continue scheduling Envoy on control-plane nodes when tunnel ingress is enabled. The tunnel process still runs when ingress is disabled because kube-apiserver remains an endpoint; its configuration simply omits ingress routes.
 
-Tunnel providers handle public HTTP-to-HTTPS redirects at their edge and do not forward port 80 to Traefik. The initial Cloudflare implementation uses a hostname-scoped redirect rule; a future ngrok implementation can use its redirect Traffic Policy. Providers without an edge redirect may expose HTTPS only rather than adding a port-80 tunnel upstream.
+Tunnel providers handle public HTTP-to-HTTPS redirects at their edge and do not forward port 80 to Envoy. The initial Cloudflare implementation uses a hostname-scoped redirect rule; a future ngrok implementation can use its redirect Traffic Policy. Providers without an edge redirect may expose HTTPS only rather than adding a port-80 tunnel upstream.
 
 Each `knc` control-plane VM's production tunnel is intrinsic to its vmconfig configuration and follows the VM lifecycle. Nstance neither starts that process nor publishes desired state for it. While a shard is asleep, a wake-capable shard leader advertises a separate wake tunnel targeting its local `nstance-proxy`. Reconciliation toward asleep waits for that local wake path before terminating control-plane VMs. Reconciliation toward awake restores the VMs, waits for ordinary fresh agent health and the requested upstream TCP port, then withdraws the wake path. The external tunnel endpoint remains stable.
 
@@ -225,7 +225,7 @@ Wake-tunnel ownership follows shard leadership without a distributed handoff pro
 
 Cloudflare tunnel processes using one credential provide availability but no traffic steering. Therefore production and wake tunnel processes may overlap only during transitions, when both paths can serve requests; the wake tunnel process must be withdrawn while the tenant is awake so normal traffic bypasses `nstance-proxy`.
 
-The initial Cloudflare implementation uses public HTTPS applications, not Cloudflare's arbitrary-TCP client mode. Clients connect to Cloudflare's HTTPS edge on port 443 without `cloudflared`; Cloudflare terminates client TLS and sends HTTPS through the tunnel to kube-apiserver on local port 6443 or Traefik on local port 443. The `nst` wake tunnel process sends the same HTTPS origin traffic to local `nstance-proxy`, which transparently forwards it to the selected production port after wake. Locally managed ingress rules allow the control-plane and `nst` tunnel processes to use these different local targets despite sharing one tunnel credential.
+The initial Cloudflare implementation uses public HTTPS applications, not Cloudflare's arbitrary-TCP client mode. Clients connect to Cloudflare's HTTPS edge on port 443 without `cloudflared`; Cloudflare terminates client TLS and sends HTTPS through the tunnel to kube-apiserver on local port 6443 or Envoy on local port 443. The `nst` wake tunnel process sends the same HTTPS origin traffic to local `nstance-proxy`, which transparently forwards it to the selected production port after wake. Locally managed ingress rules allow the control-plane and `nst` tunnel processes to use these different local targets despite sharing one tunnel credential.
 
 Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and content. In tunnel mode, Podplane generates the kubeconfig API URL on external port 443 and relies on the operating system's public CA roots for the Cloudflare edge certificate instead of embedding the kube-apiserver CA. Cloudflare-to-origin connections remain TLS-protected. For the API route, vmconfig configures `cloudflared` with the Podplane cluster CA and API hostname. For ingress routes, it uses the configured ingress issuer CA or public roots and the ingress hostname. TLS verification must not be disabled.
 
@@ -254,6 +254,6 @@ Scale-to-zero requires an exposure method capable of reaching `nstance-proxy`, u
 - **Nstance server:** versioned proxy and tunnel-supervisor Unix gRPC control services, target membership, cached local/agent file delivery, and ordered transitions.
 - **Nstance tunnel supervisor:** narrow desired-state/status protocol, locally allowlisted process lifecycle, readiness, restart/backoff, stream-loss cleanup, and least-privilege isolation.
 - **vmconfig:** production `knc` tunnels; installation, local configuration, and hardening of `nstance-proxy`, `nstance-tunnel`, and tunnel clients; local routing; and protected-file secret watchers.
-- **Components/Traefik:** retain control-plane host exposure on port 443 for tunnels and ports 80/443 for NLBs; no kube-apiserver proxying.
+- **Components/Envoy Gateway:** retain control-plane host exposure on port 443 for tunnels and ports 80/443 for NLBs; no kube-apiserver proxying.
 
 Tests must cover shared and separate listener groups, same-tenant shared and cross-tenant rejected load balancers, AWS regional target groups shared across shards and Availability Zones, proxy-port uniqueness, cross-zone enable-before-sleep and disable-after-wake ordering, cluster-leader replacement during each transition, Google Cloud forwarding-rule-address dispatch and equal-port validation, versioned Unix-stream initial/replacement snapshots and reconnect, in-place listener reconciliation, initial secret-miss coalescing, Google Cloud `GCE_VM_IP` NEG metadata resolution and subnet selection, shared same-zone NEG membership, public-HTTPS tunnel kubeconfig and origin verification, one and multiple wake-capable shards, zero-sized group exclusion, partial upstream health, provider-health readiness timeouts and rollback, AWS fail-open without treating an unhealthy target as ready, shard-leader replacement, bounded connection holding, supervisor stream closure, tunnel readiness and failure, process restart/backoff, least privilege, absence of lifecycle state files, direct kube-apiserver access, and sleep/wake transitions without empty registration sets.

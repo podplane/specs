@@ -69,14 +69,14 @@ Implementation requirement: use a registry library path that sends the token as 
 Reasons:
 
 - It removes the need for a dependency on an ingress controller, useful for example because:
-  - developers may want a cluster only for background worker payloads, and do not wish to run/install Traefik
+  - developers may want a cluster only for background worker payloads, and do not wish to run/install Envoy Gateway
   - for those use cases, they must still be able to push images to the registry
 - Kubernetes authorizes the port-forward, but registry authorization is Zot OIDC ACLs against the user's Podplane OIDC token user/group claims.
 - It avoids exposing push on public ingress.
 - It works for local, AWS, and future GCP clusters with the same CLI path.
 - It keeps registry writes inside Kubernetes, where the write-capable bucket identity belongs.
 
-Do not require public Traefik/Gateway ingress for `podplane push`.
+Do not require public Gateway ingress for `podplane push`.
 
 ## Optional Docker-compatible ingress
 

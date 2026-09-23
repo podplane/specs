@@ -241,11 +241,11 @@
 - Keep the operator highly available during normal operation and schedulable on the final supported one-node topology.
 - Ensure platform RBAC initially limits sleep requests to `podplane:admins`, which is bound to `cluster-admin`; the CLI's access review is an additional check, not the authorization boundary.
 **Exit gate:** RBAC tests demonstrate the operator can reconcile sleep requests but cannot mutate unrelated cluster-scoped resources, and non-admin users cannot patch the sleep annotation under the shipped policy. Bootstrap tests prove the operator registers from the seeded Secret, deletes that Secret only after durable certificate storage, retries safely after a lost registration response, and reuses its managed certificate after the nonce expires.
-### Phase 3: Preserve Traefik host exposure
-- Keep Traefik as a DaemonSet with host ports 80 and 443 in both NLB and tunnel modes; tunnel configuration simply omits a port-80 origin route.
-- Add explicit scheduling/toleration tests proving Traefik remains present on control-plane nodes when tunnel ingress is enabled.
-- Do not route kube-apiserver through Traefik.
-**Exit gate:** rendered manifests and a cluster smoke test verify direct local access to Traefik on control-plane port 443 and direct kube-apiserver port 6443.
+### Phase 3: Preserve Envoy host exposure
+- Keep Envoy as a DaemonSet with host ports 80 and 443 in both NLB and tunnel modes; tunnel configuration simply omits a port-80 origin route.
+- Add explicit scheduling/toleration tests proving Envoy remains present on control-plane nodes when tunnel ingress is enabled.
+- Do not route kube-apiserver through Envoy Gateway.
+**Exit gate:** rendered manifests and a cluster smoke test verify direct local access to Envoy on control-plane port 443 and direct kube-apiserver port 6443.
 ### Phase 4: Correct component-set semantics and documentation
 - Document `nstance-operator` as a protected AWS/Google provider overlay for `recommended` clusters, not part of the generic recommended addon set.
 - Remove or correct the existing stale documentation that describes Nstance as a recommended addon before the charts exist.
@@ -279,7 +279,7 @@
 - Generate stable API/ingress endpoint outputs:
   - NLB API defaults to external port 6443 and embeds the Kubernetes CA;
   - Cloudflare API uses external port 443 and public CA roots;
-  - kube-apiserver remains independent of Traefik.
+  - kube-apiserver remains independent of Envoy Gateway.
 - Pass only non-sensitive operator bootstrap configuration—cluster ID, tenant, shard addresses, CA ConfigMap name, and nonce Secret name/key—into component values. The state-safe provider operation inserts the actual one-time nonce directly into the cluster-specific Netsy seed.
 **Exit gate:** golden Terraform tests cover AWS and Google Cloud for NLB, Cloudflare tunnel, both NAT modes, and sleep on/off; sensitive values are absent from generated non-sensitive files.
 ### Phase 3: Inject operator bootstrap material into the cluster-specific seed

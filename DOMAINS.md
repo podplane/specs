@@ -6,7 +6,7 @@
 
 Podplane clusters may optionally have one or more domains for application ingress and stable cluster endpoints. Domain configuration is independent of the infrastructure provider: for example, a cluster may run on AWS while Cloudflare manages its DNS.
 
-Domains are optional. A cluster running only workers may omit them and may omit Traefik and other ingress components.
+Domains are optional. A cluster running only workers may omit them and may omit Envoy Gateway and other ingress components.
 
 ## Domain model
 
@@ -149,7 +149,7 @@ When a domain is configured, the cluster-create wizard writes `cluster.registry.
 }
 ```
 
-Registry ingress is disabled by default. `podplane push` continues to use Kubernetes port-forwarding and does not require Traefik or public registry ingress. Node-local Zot resolves the configured registry hostname locally for containerd pulls.
+Registry ingress is disabled by default. `podplane push` continues to use Kubernetes port-forwarding and does not require Envoy Gateway or public registry ingress. Node-local Zot resolves the configured registry hostname locally for containerd pulls.
 
 If registry ingress is later enabled, the existing hostname works through the default domain's selected load balancer without changing deployed image references. If admins desire a separate registry load balancer, this is outside scope but still achievable by adding custom .tf config to the generated-tf module.
 
@@ -159,7 +159,7 @@ Domainless clusters use the existing internal registry hostname `<cluster-id>-re
 
 The Kubernetes API uses its Podplane cluster CA, which the CLI places in kubeconfig.
 
-Ingress starts with temporary bootstrap certificates. Domains using a supported ACME DNS provider can use publicly trusted apex and wildcard certificates; manual domains and unsupported DNS providers continue using the self-signed ingress issuer. See [ACME.md](./ACME.md) for configuration, credentials, issuance, and renewal behavior.
+The Podplane operator always publishes a self-signed apex-and-wildcard fallback certificate. Domains using a supported ACME DNS provider can replace that fallback with a publicly trusted certificate; manual domains and unsupported DNS providers retain the fallback. See [ACME.md](./ACME.md) for configuration, credentials, issuance, delivery, and renewal behavior.
 
 ## Cluster-create wizard
 
@@ -222,10 +222,10 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kuber
 
 ### 6. Wire seeded ingress configuration
 
-- Continue passing all configured domains to the Traefik component, with the first marked as its default.
-- Ensure no ingress, cert-manager, or Traefik components are enabled solely because a domain is absent.
+- Pass all configured domains to Envoy Gateway and the Podplane operator, with the first marked as the default.
+- Ensure no ingress or ingress-certificate components are enabled solely because a domain is absent.
 - Keep registry ingress disabled unless explicitly enabled; when enabled, route `registry.<default-domain>` through the default domain's selected load balancer.
-- Keep ACME and cert-manager DNS-01 automation aligned with [ACME.md](./ACME.md), including per-domain issuer selection.
+- Keep operator-owned ACME DNS-01 automation and external SDS delivery aligned with [ACME.md](./ACME.md).
 
 ### 7. Verify end-to-end behavior
 
