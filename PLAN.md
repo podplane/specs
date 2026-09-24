@@ -78,8 +78,8 @@
   - [ ] Run as a dedicated least-privileged user, start only locally configured implementations, and implement readiness plus process restart/backoff with access limited to required tunnel credentials/configuration.
   - [x] Keep executable paths, arbitrary arguments, shell commands, secrets, provider-specific configuration, systemd, and provider probes out of Nstance control messages.
 - [x] Implement bounded secret-cache miss coalescing and validated file-patch delivery with hash/completion publication through existing agent file streams; instance rotation removes files that are no longer configured.
-- [x] Add `proxy.files` generation and an atomic local receive-directory writer.
-- [x] Publish `proxy.files` to the local receive directory as part of the server/proxy composition.
+- [x] Add `server.files` generation and an atomic server-local file writer.
+- [x] Publish `server.files` to the configured local files directory as part of the server composition.
 **Exit gate:** proxy integration tests cover connection holding, timeout, listener isolation, destination-IP dispatch, runtime exclusion of groups with zero preserved desired size, partial upstream health, restart, and concurrent wake calls.
 ### Phase 4: Strengthen provider load-balancer adapters and cutover state machines
 - [x] Add provider lifecycle inspection for registered, healthy/routable, draining, partially registered, and fully deregistered targets, and fail closed when deletion cannot confirm deregistration.
@@ -199,7 +199,7 @@
 - Configure `nstance-server` with the existing vmconfig user-data and watch machinery rather than the Nstance module's generic server userdata.
 - Enable `nstance-proxy` only when sleep support is configured. Keep it running while awake and asleep; only Nstance changes external routing.
 - Create runtime users and strict ownership for the root-owned, proxy-accessible Unix gRPC control socket; configure `nstance-proxy` to reconnect and reconcile streamed listener snapshots in place without disk-backed configuration.
-- Install files received through Nstance's local fixed receive directory using strict modes and restart only affected services.
+- Install files published through Nstance's local files directory using strict modes and restart only affected services.
 - Install, configure, and harden the separate `nstance-tunnel` supervisor, its dedicated least-privileged user, its strictly permissioned Unix gRPC socket, and locally allowlisted tunnel implementations. Give it access only to required tunnel credentials/configuration.
 - Keep wake-tunnel runtime desired/readiness reconciliation in `nstance-tunnel`, including stream-close cleanup, readiness/failure reporting, and process restart/backoff. Use no lifecycle state files. Production `knc` tunnels remain intrinsic to VM configuration and unchanged.
 - Add Cloudflare-specific `knc` and `nst` configuration:

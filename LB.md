@@ -16,8 +16,8 @@ Both integrate with scale-to-zero without placing `nstance-proxy` in the normal 
 While Kubernetes is awake:
 
 - NLB ports 80 and 443 route directly to Envoy on cluster nodes;
-- the NLB's configured external API port, defaulting to 6443, routes directly to kube-apiserver port 6443 on control-plane nodes;
-- tunnel processes run on control-plane VMs and use local kube-apiserver and Envoy ports.
+- the NLB's configured external API port, defaulting to 6443, routes directly to kube-apiserver port 6443 on control-plane/ingress nodes;
+- tunnel processes run on control-plane/ingress VMs and use local kube-apiserver and Envoy ports.
 
 Kube-apiserver must not depend on Envoy Gateway for ingress, because a broken ingress controller must not lock administrators out of the cluster.
 
@@ -25,7 +25,7 @@ Nstance registers agent-healthy instances with AWS target groups or Google Cloud
 
 ## Scale-to-zero `nstance-proxy`
 
-When Podplane sleep support is enabled, vmconfig enables a separate, minimal `nstance-proxy` systemd service on every `nst` (nstance-server) VM using a generated environment setting. The service remains running while the tenant is awake and asleep; Nstance changes routing, not its process lifecycle. Without sleep support, vmconfig does not enable it. The nstance-server process is never publicly exposed.
+When Podplane sleep support is enabled, vmconfig enables a separate, minimal `nstance-proxy` systemd service on every `nst` (nstance-server) VM using a generated environment setting. The service remains running while the tenant is awake and asleep; Nstance changes routing, not its process lifecycle. Without sleep support enabled, vmconfig does not enable it. The nstance-server process is never publicly exposed.
 
 Each shard leader manages its configured proxy listeners. While a local tenant is asleep, a listener whose group has nonzero preserved size routes NLB or tunnel traffic to local `nstance-proxy`; a zero-sized group does not advertise that wake target. After a shard leadership change, the new leader installs its routes and the old leader removes or disarms its routes; no server-to-server forwarding is required.
 
@@ -42,11 +42,12 @@ Proxy listeners are independent: a held request proceeds as soon as its configur
 
 ## Proxy configuration
 
-`load_balancers` is the source of truth for external routing and proxy listeners. Its provider-specific shape reflects each routing mechanism.
+The nstance-server configuration file's `load_balancers` field is the source of truth for external routing and proxy listeners. Its provider-specific shape reflects each routing mechanism. The first three examples below are fragments of that file; the later `listeners` examples are generated runtime snapshots streamed to `nstance-proxy`, not nstance-server configuration files.
 
-AWS configuration names every target group and its public, production, and proxy ports:
+An AWS entry in the nstance-server configuration file names every target group and its public, production, and proxy ports:
 
 ```jsonc
+// nstance-server configuration file example
 "load_balancers": {
   "control-plane": {
     "provider": "aws",
@@ -62,9 +63,10 @@ AWS configuration names every target group and its public, production, and proxy
 
 Terraform creates one regional AWS target group for each exposed listener: Envoy ports 80 and 443 and the configured kube-apiserver listener. The same target-group ARNs are passed to every shard. Shard leaders register and deregister only their local production and proxy targets; target groups are not duplicated per Availability Zone or shard.
 
-Google Cloud configuration lists its zonal `GCE_VM_IP` NEGs and passthrough frontends. The list includes every eligible production subnet and the Nstance server subnet without repeating those subnet IDs:
+A Google Cloud entry in the nstance-server configuration file lists its zonal `GCE_VM_IP` NEGs and passthrough frontends. The list includes every eligible production subnet and the Nstance server subnet without repeating those subnet IDs:
 
 ```jsonc
+// nstance-server configuration file example
 "load_balancers": {
   "control-plane": {
     "provider": "google",
@@ -82,9 +84,10 @@ Google Cloud configuration lists its zonal `GCE_VM_IP` NEGs and passthrough fron
 
 At startup and configuration reload, Nstance reads each configured NEG from Google Cloud and uses its immutable subnetwork metadata to build the subnet-to-NEG lookup for that logical load balancer. Validation requires each NEG to use `GCE_VM_IP`, belong to the shard's zone, and map to a unique subnet within the logical load balancer. Terraform creates the NEGs, attaches them to the regional backend service, and passes only their names to Nstance. Multiple shards sharing a zone and subnet receive the same NEG name and independently mutate only their own endpoints.
 
-Tunnel configuration names only production and local proxy ports:
+A tunnel entry in the nstance-server configuration file names only production and local proxy ports:
 
 ```jsonc
+// nstance-server configuration file example
 "load_balancers": {
   "control-plane-tunnel": {
     "provider": "tunnel",
@@ -96,13 +99,14 @@ Tunnel configuration names only production and local proxy ports:
 }
 ```
 
-Tunnel listeners need no user-defined name; generated runtime keys use `<load-balancer-key>:<proxy-port>`. Hostnames, tunnel IDs, credentials, and provider commands remain in vmconfig and `proxy.files`.
+Tunnel listeners need no user-defined name; generated runtime keys use `<load-balancer-key>:<proxy-port>`. Hostnames, tunnel IDs, credentials, and provider commands remain in vmconfig and `server.files`.
 
 Each logical load balancer may be referenced by any number of groups within exactly one tenant. Their instances form its combined backend set, and `nstance-proxy` forwards to any healthy instance among them. Groups requiring different membership use separate logical load-balancer keys; the existing group `load_balancers` list is unchanged. AWS requires a distinct `proxy_port` for each listener sharing an `nst` VM because the backend sees the VM address, not the NLB address. Google Cloud passthrough frontends may share a local port because `nstance-proxy` can dispatch by the preserved forwarding-rule destination IP.
 
-At startup and configuration reload, nstance-server derives static runtime configuration from `load_balancers` and group references:
+At startup and configuration reload, nstance-server derives the following runtime listener snapshot from `load_balancers` and group references and streams it to `nstance-proxy`. This is not an nstance-server configuration-file fragment:
 
 ```jsonc
+// derived configuration provided to nstance-proxy
 {
   "listeners": {
     "control-plane:6443": {
@@ -117,9 +121,10 @@ At startup and configuration reload, nstance-server derives static runtime confi
 
 Listener identity is the key in the `listeners` map and is not duplicated in the listener value. AWS and tunnel identities use `<load-balancer-key>:<proxy-port>`. A Google listener uses `<load-balancer-key>:<port>` when its port is unique across configured Google frontends. When the port is shared, its identity uses `<load-balancer-key>/<destination-ip>:<port>` and `destination_ip` is included in the listener value. Standard host-and-port formatting keeps IPv6 identities unambiguous.
 
-For example, two Google Cloud frontends sharing port 443 require destination-IP dispatch:
+The following is another generated runtime listener snapshot rather than an nstance-server configuration-file fragment. It shows two Google Cloud frontends sharing port 443 and therefore requiring destination-IP dispatch:
 
 ```jsonc
+// derived configuration provided to nstance-proxy
 {
   "listeners": {
     "control-plane/34.10.20.30:443": {
@@ -204,14 +209,14 @@ Inbound security-group/firewall access remains denied except for explicitly conf
 
 The tunnel feature contract is provider-neutral, with Cloudflare Tunnel as the initial implementation.
 
-vmconfig installs the selected tunnel client on both `knc` control-plane VMs and `nst` Nstance Server VMs. Provider-specific vmconfig variants/kinds may package different clients without adding provider logic to Nstance.
+vmconfig installs the selected tunnel client on both `knc` control-plane/ingress VMs and `nst` Nstance Server VMs. Provider-specific vmconfig variants/kinds may package different clients without adding provider logic to Nstance.
 
-Each control-plane VM runs one tunnel process for both kube-apiserver and ingress. `knc` is the VM-level control-plane role. Podplane runs Envoy as a host-port DaemonSet on every schedulable node, including control-plane nodes, so the tunnel uses stable local upstreams:
+Each control-plane/ingress VM runs one tunnel process for both kube-apiserver and ingress. `knc` is the VM-level control-plane role. Podplane runs Envoy as a host-port DaemonSet on every schedulable node, including control-plane/ingress nodes, so the tunnel uses stable local upstreams:
 
 - kube-apiserver on port 6443;
 - Envoy on port 443 when ingress is enabled.
 
-No separate ingress-node role or live upstream discovery is required. Components must continue scheduling Envoy on control-plane nodes when tunnel ingress is enabled. The tunnel process still runs when ingress is disabled because kube-apiserver remains an endpoint; its configuration simply omits ingress routes.
+No separate ingress-node role or live upstream discovery is required. Components must continue scheduling Envoy on control-plane/ingress nodes when tunnel ingress is enabled. The tunnel process still runs when ingress is disabled because kube-apiserver remains an endpoint; its configuration simply omits ingress routes.
 
 Tunnel providers handle public HTTP-to-HTTPS redirects at their edge and do not forward port 80 to Envoy. The initial Cloudflare implementation uses a hostname-scoped redirect rule; a future ngrok implementation can use its redirect Traffic Policy. Providers without an edge redirect may expose HTTPS only rather than adding a port-80 tunnel upstream.
 
@@ -229,13 +234,30 @@ The initial Cloudflare implementation uses public HTTPS applications, not Cloudf
 
 Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and content. In tunnel mode, Podplane generates the kubeconfig API URL on external port 443 and relies on the operating system's public CA roots for the Cloudflare edge certificate instead of embedding the kube-apiserver CA. Cloudflare-to-origin connections remain TLS-protected. For the API route, vmconfig configures `cloudflared` with the Podplane cluster CA and API hostname. For ingress routes, it uses the configured ingress issuer CA or public roots and the ingress hostname. TLS verification must not be disabled.
 
-## Proxy files and tunnel secrets
+## Server files and tunnel secrets
 
-`proxy.files` reuses the existing `FileConfig` schema and generation code for tunnel secrets and other server-local files. It is not included in the generated `nstance-proxy` configuration. Nstance-server atomically replaces each file in its fixed receive directory; vmconfig validates and installs them for local services. The same tunnel secret source may also appear in a `knc` template and be delivered through the existing Nstance-agent file channel. Agent transfers are patches: omitted files remain unchanged, all payloads are validated before changes are applied, and the configuration hash and completion marker are published last. Instance rotation removes files that are no longer configured.
+`server.files` reuses the existing `FileConfig` schema and generation code for tunnel secrets and other server-local files:
+
+```jsonc
+"server": {
+  "files": {
+    "cloudflare-token": {
+      "kind": "secret",
+      "source": "cloudflare-tunnel-token"
+    },
+    "cloudflared.json": {
+      "kind": "storage",
+      "source": "tunnels/cloudflared.json"
+    }
+  }
+}
+```
+
+These files are not included in the generated `nstance-proxy` configuration. Nstance-server atomically replaces each file in its configured local files directory; vmconfig validates and installs them for local services. The same tunnel secret source may also appear in a `knc` template and be delivered through the existing Nstance-agent file channel. Agent transfers are patches: omitted files remain unchanged, all payloads are validated before changes are applied, and the configuration hash and completion marker are published last. Instance rotation removes files that are no longer configured.
 
 Nstance's secret cache remains in-memory and per server process. Initial misses for one source are coalesced so local and agent delivery cause one provider read per cache lifetime. Secret values are not persisted in shared Nstance state. vmconfig-owned watchers install them with strict ownership and modes and restart only affected services; secrets must not appear in generated Terraform values, process arguments, logs, or world-readable files.
 
-Nstance delivers credentials and provider configuration only as protected files through `proxy.files` and vmconfig. Lifecycle and configuration control streams never contain secrets, commands, executable selection, or provider-specific configuration. For the leader-local wake tunnel, Nstance sends only generic named revisioned desired state to `nstance-tunnel` and consumes its matching status. vmconfig owns production tunnel lifecycle and local installation/configuration of allowed wake-tunnel implementations, keeping Cloudflare- or ngrok-specific paths, commands, and probes out of Nstance.
+Nstance delivers credentials and provider configuration only as protected files through `server.files` and vmconfig. Lifecycle and configuration control streams never contain secrets, commands, executable selection, or provider-specific configuration. For the leader-local wake tunnel, Nstance sends only generic named revisioned desired state to `nstance-tunnel` and consumes its matching status. vmconfig owns production tunnel lifecycle and local installation/configuration of allowed wake-tunnel implementations, keeping Cloudflare- or ngrok-specific paths, commands, and probes out of Nstance.
 
 ## Configuration
 
