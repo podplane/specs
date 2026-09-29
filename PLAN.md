@@ -21,12 +21,11 @@
   - [x] Provider-neutral tunnel listeners with target and proxy ports.
 - [x] Use `google` as the Google Cloud infrastructure and load-balancer provider literal and `google-secret-manager` as its Secret Manager provider literal. The former `gcp` and `gcp-secret-manager` literals are unsupported in 2.0.0.
 - [x] Add the top-level tenant `nat` map from NAT.md and validate:
-  - [x] at most one dedicated NAT group per tenant;
-  - [x] at least one of dedicated or small-cluster NAT when the tenant entry exists;
+  - [x] exactly one NAT group per configured tenant;
   - [x] no fixed `size` on a derived NAT group;
-  - [x] initial-subnet reservation and cross-tenant subnet exclusivity;
+  - [x] cross-tenant subnet exclusivity;
   - [x] tenant-owned `network_identity_pool`, `last_node_grace_period`, ordered `instance_type_ladder`, thresholds, scaling windows, cooldown, and replacement timeout.
-- [x] Define shared `pkg/proxy` structs used by both `nstance-server` and the new `nstance-proxy` binary. Represent static listener identity as the map key; include only tenant, groups, target port, proxy port, and optional destination IP in each value.
+- [x] Define shared `pkg/proxy` structs used by the nstance-server control plane and `nstance-server proxy`. Represent static listener identity as the map key; include only tenant, groups, target port, proxy port, and optional destination IP in each value.
 - [x] Extend the operator gRPC contract with idempotent `SleepTenant` and `WakeTenant` result/status semantics needed for all-shard compensation. Make `if_not_busy`, optional `wake_at`, optional listener-scoped wake, optional ready upstream, and already-awake/asleep results explicit.
 - [x] Have nstance-operator read bootstrap trust from a Kubernetes ConfigMap and the one-time registration nonce from a dedicated Secret in the cluster-specific Netsy seed.
 - [x] Define and test the cross-repository registration nonce claims/signature contract in public `pkg/nonce`, and retain the PKCS#8 PEM Ed25519 signing-key storage contract. Keep Nstance's lazy create-if-absent key generation for non-Podplane deployments; the Podplane Terraform provider may create or read the same key without importing Nstance's `internal` packages.
@@ -48,22 +47,22 @@
 ### Phase 2: Add durable tenant sleep state and transition serialization
 - [x] Add `shard/<shard>/tenants.jsonc` storage models and ETag/generation compare-and-swap helpers.
 - [x] Implement idempotent sleep-entry add/update and removal without writing desired group sizes into tenant state.
-- [ ] Add a tenant-scoped transition lock that serializes:
-  - [ ] normal and forced sleep;
+- [x] Add a tenant-scoped transition lock that serializes:
+  - [x] normal and forced sleep;
   - [x] network and timer wake;
   - [x] proxy payload arrival during sleep;
-  - [ ] provider target cutovers.
+  - [x] provider target cutovers.
 - [x] Resume sleep-state reconciliation from durable state after process restart or shard-leader replacement.
 - [x] Implement per-shard wake timers from `wake_at` and converge concurrent wake calls through the same CAS operation in the tenant-state manager.
 - [x] Start and stop the tenant-state manager with shard leadership and compose timer and network wakes with reconciliation.
 - [x] Ensure effective group size is zero only while the sleep entry exists, while preserving administrator/operator desired sizes in the existing group state.
 - [x] Keep tenant state shard-local.
-- [ ] Add only the AWS cross-zone disable barrier to cluster-leader coordination.
+- [x] Add only the AWS cross-zone disable barrier to cluster-leader coordination.
 **Exit gate:** storage tests cover CAS conflicts, restart/failover, simultaneous wake triggers, sleep updates, and removal of empty tenant keys; reconciliation tests prove desired sizes survive sleep.
-### Phase 3: Implement listener derivation and `nstance-proxy`
+### Phase 3: Implement listener derivation, `nstance-server proxy`, and `nstance-server tunnel`
 - [x] Derive the static `listeners` map at config load and reload time, with listener identity represented only by the map key. Use `<load-balancer-key>:<proxy-port>` for AWS and tunnel listeners; for Google Cloud, use `<load-balancer-key>:<port>` when the port is unique or `<load-balancer-key>/<destination-ip>:<port>` when a shared port requires destination-IP dispatch. Do not infer runtime wake eligibility from the static group size; reject cross-tenant references, invalid ports, duplicate Google Cloud destination-IP/port selectors, proxy-port collisions, and server-port collisions.
-- [x] Add one root-owned, proxy-accessible Unix gRPC control socket with a versioned initial-and-replacement listener configuration stream; make `nstance-proxy` wait for the initial snapshot, validate complete replacements, reconcile listeners in place, retain the last valid snapshot only during a brief reconnect, stop leader-owned work on stream loss, and persist no proxy configuration state.
-- [x] Add the `nstance-proxy` binary:
+- [x] Add one root-owned, proxy-accessible Unix gRPC control socket with a versioned initial-and-replacement listener configuration stream; make `nstance-server proxy` wait for the initial snapshot, validate complete replacements, reconcile listeners in place, retain the last valid snapshot only during a brief reconnect, stop leader-owned work on stream loss, and persist no proxy configuration state.
+- [x] Add the `nstance-server proxy` subcommand:
   - [x] bind configured ports and dispatch Google Cloud shared ports by accepted destination IP;
   - [x] expose health checks that never call `WakeTenant`;
   - [x] hold client connections for a bounded configurable timeout;
@@ -71,49 +70,54 @@
   - [x] forward to the returned private `IP:target_port` and let established connections drain after direct routing is restored.
 - [x] Keep listener-scoped `WakeTenant` as the only operation besides the listener stream on the same root-owned, proxy-accessible Unix gRPC control socket.
 - [x] Start and stop the wake server with shard leadership and return an upstream only after agent health and target-port readiness are both satisfied.
-- [x] Add the minimal `nstance-tunnel` supervisor and its separate strictly permissioned Unix gRPC control socket:
-  - [x] Keep production tunnel lifecycle intrinsic to `knc` vmconfig; Nstance publishes no production lifecycle state and nstance-agent reports no tunnel-specific readiness.
+- [x] Add `nstance-server tunnel` as a separate privileged root supervisor process with a strictly permissioned Unix gRPC control socket, without distributing another binary:
+  - [x] Keep production tunnel lifecycle intrinsic to the `knc` VM lifecycle; Nstance publishes no production lifecycle state and nstance-agent reports no tunnel-specific readiness.
   - [x] Use ordinary fresh agent health and requested upstream TCP readiness as Nstance's production recovery barrier.
-  - [x] Stream only named wake-tunnel identity/revision desired state and `starting`/`ready`/`failed`/`stopped` status; stop leader-owned wake tunnels when the stream closes and write no lifecycle state files.
-  - [ ] Run as a dedicated least-privileged user, start only locally configured implementations, and implement readiness plus process restart/backoff with access limited to required tunnel credentials/configuration.
-  - [x] Keep executable paths, arbitrary arguments, shell commands, secrets, provider-specific configuration, systemd, and provider probes out of Nstance control messages.
+  - [x] Have the supervisor initiate and reconnect the local stream to nstance-server, independently read the same root-controlled shard configuration, and resolve referenced secret/storage files itself.
+  - [x] Define server messages containing only allowlisted tunnel name, desired running/stopped state, revision, and renewable lease; never send images, commands, mounts, manifests, secrets, credentials, storage contents, or provider details.
+  - [x] Send heartbeats while leadership is held, revoke immediately on explicit leadership loss, and retain current state through an ambiguous disconnect only until the bounded lease expires before stopping fail-closed.
+  - [x] Remove stale supervisor-owned static-Pod manifests and resolved files on startup before loading configuration because leases do not survive supervisor restart.
+  - [x] Add a provider-neutral top-level `tunnels` block with immutable digest-pinned container images and mounted secret/storage files.
+  - [x] Generate hardened kubelet static Pods and support either dedicated tunnel Pods or independently controlled logical endpoints in one shared local agent while any endpoint is active.
+  - [x] Keep Cloudflare on dedicated processes/credentials initially, permit an ngrok shared-agent implementation, and keep all provider-specific images/configuration in containers and generated deployment configuration rather than Nstance or vmconfig code.
+  - [x] Implement revisioned readiness, restart/backoff, and no lifecycle state files.
 - [x] Implement bounded secret-cache miss coalescing and validated file-patch delivery with hash/completion publication through existing agent file streams; instance rotation removes files that are no longer configured.
 - [x] Add `server.files` generation and an atomic server-local file writer.
 - [x] Publish `server.files` to the configured local files directory as part of the server composition.
 **Exit gate:** proxy integration tests cover connection holding, timeout, listener isolation, destination-IP dispatch, runtime exclusion of groups with zero preserved desired size, partial upstream health, restart, and concurrent wake calls.
 ### Phase 4: Strengthen provider load-balancer adapters and cutover state machines
 - [x] Add provider lifecycle inspection for registered, healthy/routable, draining, partially registered, and fully deregistered targets, and fail closed when deletion cannot confirm deregistration.
-- [ ] Keep provider transition progress in reconciled state so leadership changes safely continue or roll back a cutover.
-- [ ] Implement the common sleep sequence:
+- [x] Keep provider transition progress in reconciled state so leadership changes safely continue or roll back a cutover.
+- [x] Implement the common sleep sequence:
   1. perform any provider prerequisite barrier, including enabling and confirming AWS target-group cross-zone balancing;
   2. register proxy;
   3. wait for provider health/routability;
   4. start production draining;
   5. wait for a fresh agent report and perform the busy check immediately before withdrawal completes;
   6. restore production on activity/error, otherwise finish withdrawal and commit sleep.
-- [ ] Implement the common wake sequence:
+- [x] Implement the common wake sequence:
   1. restore desired infrastructure;
   2. wait for upstream and production provider health;
   3. withdraw proxy with draining;
   4. leave proxy installed and continue reconciliation if production readiness times out.
-- [ ] Never permit the intended registration sets to become empty, and never interpret provider fail-open routing as readiness.
-- [ ] AWS adapter:
+- [x] Never permit the intended registration sets to become empty, and never interpret provider fail-open routing as readiness.
+- [x] AWS adapter:
   - [x] register instance targets with per-listener port overrides;
   - [x] inspect aggregate target health and deregistration completion across every configured target group;
   - [x] expose an idempotent operation that sets and confirms target-group cross-zone balancing;
-  - [ ] invoke and reconcile cross-zone enablement before sleep;
-  - [ ] let the cluster leader disable it only after all shards have restored production and removed proxies, serialized against new sleeps.
-- [ ] Google Cloud adapter:
+  - [x] invoke and reconcile cross-zone enablement before sleep;
+  - [x] let the cluster leader disable it only after all shards have restored production and removed proxies, serialized against new sleeps.
+- [x] Google Cloud adapter:
   - [x] inspect configured NEGs at startup/reload and validate `GCE_VM_IP`, zone, and unique subnet mapping;
   - [x] select the NEG by the instance interface's subnet;
   - [x] add/remove VM-IP endpoints and inspect aggregate frontend/backend health and draining;
-  - [ ] support the Nstance-server subnet endpoint during sleep.
-- [ ] Tunnel adapter/state machine:
-  - [ ] while going to sleep, wait for `nstance-tunnel` to report the requested local wake-tunnel identity/revision ready before terminating control-plane VMs;
-  - [ ] while waking, keep the wake tunnel desired until a control-plane agent is freshly healthy and the requested local upstream is ready;
-  - [ ] permit production/wake tunnel-process overlap only during transitions and require the wake process to be absent in steady-state awake operation;
-  - [ ] reconcile local wake-tunnel ownership through shard leadership without persisting a distributed old/new-leader handoff; stream the new leader's desired identity/revision, wait for readiness, and accept a brief wake-path interruption during failover.
-**Exit gate:** deterministic provider/tunnel-process fake tests cover healthy cutover, every timeout/rollback point, AWS cross-zone confirmation before draining, tunnel-process ordering, supervisor stream closure, readiness/failure, process restart/backoff, least privilege, absence of lifecycle state files, fail-open, shard and cluster leader replacement, and no-empty-route invariants during ordinary sleep/wake cutovers. Shard-leader replacement may cause the documented brief tunnel wake-path interruption. Live cloud testing is deferred to the final cross-repository matrix after Terraform and vmconfig artifacts exist.
+  - [x] support the Nstance-server subnet endpoint during sleep.
+- [x] Tunnel adapter/state machine:
+  - [x] while going to sleep, wait for `nstance-server tunnel` to report the requested local wake-tunnel name/revision ready before terminating control-plane VMs;
+  - [x] while waking, keep the wake tunnel desired until a control-plane agent is freshly healthy and the requested local upstream is ready;
+  - [x] permit production/wake tunnel-process overlap only during transitions and require the wake process to be absent in steady-state awake operation;
+  - [x] reconcile local wake-tunnel ownership through shard leadership without persisting a distributed old/new-leader handoff; renew the new leader's desired name/revision lease, wait for readiness, and accept a bounded interruption during failover.
+**Exit gate:** deterministic provider/tunnel-process fake tests cover healthy cutover, every timeout/rollback point, AWS cross-zone confirmation before draining, tunnel-process ordering, supervisor-initiated reconnect, heartbeat renewal, explicit revocation, ambiguous-disconnect lease expiry, fail-closed stopping, readiness/failure, process restart/backoff, hardened static Pods, dedicated and shared-agent layouts, absence of provider details and lifecycle state files, fail-open, shard and cluster leader replacement, and no-empty-route invariants during ordinary sleep/wake cutovers. Live cloud testing is deferred to the final cross-repository matrix after Terraform and vmconfig artifacts exist.
 ### Phase 5: Implement placement-aware Podplane Managed NAT
 - Change subnet placement to fill sorted `/26` node subnets to 90% of AWS-conservative capacity, then round-robin across available slots.
 - Model dedicated NAT members as derived per-populated-subnet instances rather than a fixed-size group. Exclude them from MachinePool import and replica distribution.
@@ -126,15 +130,14 @@
   - Google Cloud subnet-specific node tags and tagged default routes to a forwarding VM;
   - mutate a route only while Podplane Managed NAT is configured, the resource is scoped to this cluster, and its current next hop is still Podplane-managed, so stale reconciliation cannot overwrite Terraform's Cloud Managed NAT cutover.
 - Enforce node creation ordering: select the subnet, wait for its NAT agent to register and submit a successful health report, install and verify the route, then create the node. Do not require a separate forwarding-readiness metric.
-- Implement small-cluster NAT on the elected shard leader, including activation-before-route-switch and leadership failover.
 - Implement last-node grace handling, NAT-first wake, node-first sleep, and cleanup when changing back to Cloud Managed NAT.
 - Implement both mode transitions explicitly:
   - Cloud Managed to Podplane Managed: disable Cloud Managed NAT/update Nstance configuration, retain provider and object-storage reachability, then let Nstance establish healthy next hops and install Podplane Managed routes; document the temporary general IPv4 egress outage.
-  - Podplane Managed to Cloud Managed: create and validate Cloud Managed NAT, switch node-subnet routing, then let Nstance disable small-cluster forwarding, terminate dedicated NAT instances, and release identities.
-- Keep IPv6 untranslated and preserve existing IPv6 routing through both mode changes.
+  - Podplane Managed to Cloud Managed: create and validate Cloud Managed NAT, switch node-subnet routing, then let Nstance terminate NAT instances and release identities.
+- Preserve native IPv6 routing through both mode changes; optional NAT64 remains a `nat` VM behavior rather than a provider route-mode change.
 - Implement vertical A/B replacement for dedicated NAT instances using readiness defined as agent registration plus a successful health report, the tenant-owned ordered `instance_type_ladder`, and a second stable identity. On nstance-server, derive throughput, packet, and drop rates from consecutive timestamped reports containing raw cumulative interface counters, and evaluate the tenant-owned thresholds and windows there. Scale up when any threshold remains exceeded for the configured two-to-five-minute window; scale down only when all metrics remain at or below their thresholds for the configured 20-to-30-minute window; enforce the configurable cooldown. Never perform disruptive same-identity replacement on pool exhaustion.
 - When identities are exhausted, prefer already-populated subnets with remaining capacity before blocking node scale-up.
-**Exit gate:** tests cover placement capacity, concurrent creates, current-next-hop route ownership, tenant conflicts, leader changes, both ordered mode transitions, retained provider/object-storage access, unchanged IPv6 routing, mixed metric windows, alternate-subnet placement under identity exhaustion, vertical replacement/cooldown, NAT-first wake, and node-first sleep on both providers.
+**Exit gate:** tests cover placement capacity, concurrent creates, current-next-hop route ownership, tenant conflicts, both ordered mode transitions, retained provider/object-storage access, unchanged IPv6 routing, mixed metric windows, alternate-subnet placement under identity exhaustion, vertical replacement/cooldown, NAT-first wake, and node-first sleep on both providers.
 ### Phase 6: Implement Kubernetes sleep policy in `nstance-operator`
 - Add operator configuration for disabled-by-default automatic sleep with defaults from ZERO.md: one remaining node, 30-minute inactivity, ten-minute CronJob look-ahead, and two-minute wake lead.
 - Watch CAPI Cluster/Machine/MachinePool and Nstance resources, Nodes, Jobs, CronJobs, and relevant Pods.
@@ -172,49 +175,47 @@
 **Exit gate:** `tofu validate` and provider-specific fixture plans pass; plans show no node-subnet replacement when switching NAT modes, no duplicated AWS target groups or same-zone Google NEGs, and no public path to nstance-server APIs. Network tests prove public traffic can reach configured proxy/health listeners but cannot invoke `WakeTenant`, which remains Unix-socket-only.
 ### Phase 8: Publish Nstance 2.0.0
 - Document breaking configuration/protobuf/storage changes, IAM additions, disruptive NAT route switches, Cloudflare trust boundaries, deployment requirements, and rollback boundaries; do not provide 1.x migration shims.
-- Release server, agent, operator, proxy, Helm chart, and Terraform source changes together as one pinned 2.0.0 release set.
+- Release the server binary and its proxy/tunnel subcommands, agent, operator, Helm chart, and Terraform source changes together as one pinned 2.0.0 release set.
 - State explicitly that mixed Nstance 1.x/2.x deployments and 1.x configuration or storage formats are unsupported.
 - Trigger the established Terraform sync workflow from this canonical repository and record the exact source commit in both generated mirror commits.
 **Exit gate:** all Nstance 2.0.0 artifacts are published, generated Terraform mirror commits reference the release source commit, and downstream repositories can pin the complete immutable version set.
 ## Repository: `podplane/vmconfig`
 ### Phase 1: Introduce reusable service configuration and new VM kinds
 - Extract only the shared install/configure/restart machinery into `templates/common`, then build the VM kinds as `common + knd`, `common + knd + knc`, `common + nst`, and `common + nat`, in overlay order.
-- Keep `nst` and `nat` independent. Duplicate their small forwarding/SNAT configuration rather than adding a shared feature overlay; extract it later only if maintaining both copies becomes onerous.
+- Keep `nst` and `nat` independent. Only the `nat` kind configures forwarding and SNAT.
 - Add `nst` kind for Nstance-server VMs and `nat` kind for dedicated NAT VMs, each with manifests for Debian 13 on amd64 and arm64.
-- Add manifest dependencies for `nstance-server` and `nstance-proxy`. Tag `bpftool` and required eBPF runtime libraries with a traffic-accounting feature for `knd`/`knc`, and tag the initial tunnel client (`cloudflared`) with a Cloudflare tunnel feature for `knc`/`nst`; untagged dependencies remain baseline.
-- Extend the shared manifest `ItemFilter`, Podplane userdata renderer, and Terraform `podplane_userdata` data source with selected install features. Use the same filter for downloads, checksum metadata, and installation so an unselected dependency is neither fetched nor expected in `/opt/podplane/artifacts`.
-- Write the selected immutable install-feature set before invoking `install.sh`; make `install.sh` filter generated dependency arrays from the pinned full manifest. Changing tunnel or traffic-accounting features therefore changes userdata and rotates/rebuilds affected VMs rather than mutating an already-installed machine in place.
+- Add manifest dependencies for `nstance-server`. Include `bpftool` and required eBPF runtime libraries in every `knd`/`knc` manifest; their small installed footprint does not justify conditional manifest machinery. Tunnel provider binaries are supplied by immutable container images rather than vmconfig packages.
 - Preserve strict artifact verification, reproducible packaging, standard Fluent Bit, and the existing receive/reconfigure workflow.
-**Exit gate:** package and install tests cover all four kinds (`knd`, `knc`, `nst`, and `nat`) on both architectures without regressing existing manifests. Disabled-feature fixtures fetch or install neither `cloudflared` nor `bpftool`; enabled fixtures download, verify, and install exactly the pinned artifacts. Local/offline dependency prefetch accepts or infers the same feature set.
-### Phase 2: Add traffic accounting to Kubernetes nodes
-- Build and package the vmconfig-owned eBPF ELF for active TCP connections.
-- Select the traffic-accounting install feature only for `knd`/`knc` groups that can participate in guarded normal sleep and are referenced by production listeners.
-- Derive the monitored ports from each group's production listeners: ingress ports only, kube-apiserver port only, their union for a shared group, or no accounting for a group with neither role.
+**Exit gate:** package and install tests cover all four kinds (`knd`, `knc`, `nst`, and `nat`) on both architectures without regressing existing manifests. Kubernetes-node fixtures download, verify, and install the pinned active-connection counter toolchain. Tunnel provider binaries remain absent from vmconfig packages.
+### Phase 2: Add active connection counters to Kubernetes nodes
+- Build and package the vmconfig-owned eBPF ELF for active TCP connections. Commit its source and generated object, pin the Clang version with mise, and have CI fail when rebuilding produces a different object.
+- Derive the monitored ports from each group's production listeners: ingress ports only, kube-apiserver port only, their union for a shared group, or no counters for a group with neither role.
 - Add a root-owned oneshot service that loads the ELF with `bpftool`, auto-attaches tracepoint programs, and pins links and maps under `/sys/fs/bpf/nstance/counters`.
 - Grant nstance-agent read access only to link metadata needed for validation and the `active_connections` map.
-- Configure the loaded program to ignore ports outside the derived set. When accounting is disabled, do not download or install `bpftool`, enable the loader, attach programs, create pins, set `NSTANCE_EBPF_COUNTERS_PATH`, or require counters from the agent.
+- Configure the loaded program to ignore ports outside the derived set. When no ports require monitoring, leave the installed toolchain dormant: do not enable the loader, attach programs, create pins, set `NSTANCE_EBPF_COUNTERS_PATH`, or require counters from the agent.
 - Ensure reloads update configured ports without leaving stale links/maps and that pin loss is visible as `ebpf_error` rather than silently reporting zero.
 **Exit gate:** VM tests cover ingress-only, kube-apiserver-only, combined, and disabled configurations; generate traffic on configured and ignored ports; and verify zero/nonzero counts, pinned-link loss, permissions, reboot persistence, and complete runtime absence when disabled.
-### Phase 3: Implement `nst` proxy, local files, and tunnel services
+### Phase 3: Implement `nst` proxy and tunnel services
 - Configure `nstance-server` with the existing vmconfig user-data and watch machinery rather than the Nstance module's generic server userdata.
-- Enable `nstance-proxy` only when sleep support is configured. Keep it running while awake and asleep; only Nstance changes external routing.
-- Create runtime users and strict ownership for the root-owned, proxy-accessible Unix gRPC control socket; configure `nstance-proxy` to reconnect and reconcile streamed listener snapshots in place without disk-backed configuration.
-- Install files published through Nstance's local files directory using strict modes and restart only affected services.
-- Install, configure, and harden the separate `nstance-tunnel` supervisor, its dedicated least-privileged user, its strictly permissioned Unix gRPC socket, and locally allowlisted tunnel implementations. Give it access only to required tunnel credentials/configuration.
-- Keep wake-tunnel runtime desired/readiness reconciliation in `nstance-tunnel`, including stream-close cleanup, readiness/failure reporting, and process restart/backoff. Use no lifecycle state files. Production `knc` tunnels remain intrinsic to VM configuration and unchanged.
-- Add Cloudflare-specific `knc` and `nst` configuration:
+- Enable `nstance-server proxy` only when sleep support is configured. Keep it running while awake and asleep; only Nstance changes external routing.
+- Create runtime users and strict ownership for the root-owned, proxy-accessible Unix gRPC control socket; configure `nstance-server proxy` to reconnect and reconcile streamed listener snapshots in place without disk-backed configuration.
+- Install and harden a separate privileged root `nstance-server tunnel` process and its strictly permissioned Unix gRPC socket. Nstance and vmconfig code must remain provider-neutral; deployment-generated root-controlled shard configuration supplies immutable images and mounted secret/storage file references.
+- Have `nstance-server tunnel` independently resolve files, initiate/reconnect its server stream, enforce renewable leases, report revisioned readiness/failure, apply restart/backoff, and generate hardened kubelet static Pods without lifecycle state files.
+- Keep production control-plane tunnels VM-lifecycle-owned and entirely outside Nstance control.
+- Generate Cloudflare-specific deployment configuration, without adding Cloudflare logic to vmconfig:
   - one production tunnel process per control-plane VM for kube-apiserver plus optional ingress;
-  - one wake tunnel process per eligible Nstance server;
+  - one dedicated wake tunnel process and credential per eligible Nstance server;
   - HTTPS origin verification using the cluster/ingress CA or public roots;
   - no TLS verification disablement;
   - no secrets in arguments, logs, generated Terraform values, or world-readable files.
-**Exit gate:** local VM tests prove Unix-stream reconnect and snapshot replacement, in-place proxy listener reconciliation, supervisor stream-close cleanup, wake-tunnel readiness/failure and process restart/backoff, least privilege, absence of lifecycle state files, secret rotation restarts only the affected tunnel service, and both API and ingress origins retain TLS verification.
+**Exit gate:** local VM tests prove Unix-stream reconnect and snapshot replacement, in-place proxy listener reconciliation, supervisor-initiated reconnect, heartbeat renewal, immediate revocation, bounded disconnect lease expiry, fail-closed stopping, wake-tunnel readiness/failure and restart/backoff, static-Pod hardening, secret/storage resolution without server delivery, dedicated and shared-agent layouts, absence of provider fields and lifecycle state files, and TLS verification for both API and ingress origins.
 ### Phase 4: Implement NAT host behavior
-- In the `nst` overlay, configure optional IP forwarding and source NAT for small-cluster NAT while leaving it inactive on non-leaders.
-- Independently in the `nat` overlay, configure forwarding, source NAT, conntrack limits, and Nstance agent reporting of current CPU and memory, conntrack count and limit, and raw cumulative byte, packet, and drop counters for `NSTANCE_METRICS_INTERFACE`, including explicit collection errors. Do not calculate rates or windows in vmconfig or report a separate forwarding-readiness metric.
+- In the `nat` overlay, configure IPv4 forwarding, source NAT, conntrack limits, and Nstance agent reporting of current CPU and memory, conntrack count and limit, and raw cumulative byte, packet, and drop counters for `NSTANCE_METRICS_INTERFACE`, including explicit collection errors. Do not calculate rates or windows in vmconfig or report a separate forwarding-readiness metric.
+- Support optional stateful NAT64 with Jool, defaulting to `64:ff9b::/96`. Require an IPv6 source allowlist and IPv4 pool address, block translation to non-global IPv4 destinations, and verify signed Jool modules against the exact running kernel before activation.
+- Keep `nat` images free of containerd, kubelet, their users, runtime images, configuration, and services.
 - Ensure AWS source/destination-check and Google `can_ip_forward` remain Terraform/provider concerns, not shell-script cloud API calls.
-- Make forwarding activation/deactivation idempotent and safe across reboot and Nstance leadership transitions.
-**Exit gate:** network-namespace or VM integration tests verify forwarding, SNAT, idempotent deactivation, raw cumulative interface counters, conntrack and current-utilization reporting, and explicit collection errors for `nst` and `nat`; Nstance integration tests verify readiness from registration plus a successful health report, without a forwarding-readiness metric.
+- Make forwarding activation/deactivation idempotent and safe across reboot.
+**Exit gate:** network-namespace or VM integration tests verify IPv4 forwarding, SNAT, NAT64 translation and filtering, idempotent deactivation, container-runtime absence, raw cumulative interface counters, conntrack and current-utilization reporting, and explicit collection errors for `nat`; Nstance integration tests verify readiness from registration plus a successful health report, without a forwarding-readiness metric.
 ### Phase 5: Publish manifests
 - Publish all new kind/architecture packages and manifests.
 - Pin the Nstance 2.0.0 release in each new manifest.
@@ -256,7 +257,7 @@
 ### Phase 1: Add user-facing configuration and schemas
 - Replace the current provider-only load-balancer projection with an exposure model that independently selects NLB, tunnel, or custom behavior for Kubernetes API and ingress.
 - Add provider-specific NLB settings and provider-neutral tunnel settings while keeping application domain configuration separate.
-- Add NAT mode (`cloud-managed` or `podplane-managed`), maximum dedicated NAT identities per zone, and tenant-owned `nat` settings: `network_identity_pool`, `last_node_grace_period`, ordered `instance_type_ladder`, thresholds and windows, cooldown, replacement timeout, and small-cluster NAT. Keep only the deployment template and starting `instance_type` on the referenced NAT group.
+- Add NAT mode (`cloud-managed` or `podplane-managed`), maximum NAT identities per zone, and tenant-owned `nat` settings: `network_identity_pool`, `last_node_grace_period`, ordered `instance_type_ladder`, thresholds and windows, cooldown, and replacement timeout. Keep only the deployment template and starting `instance_type` on the referenced NAT group.
 - Add disabled-by-default sleep policy with activity windows, CronJob look-ahead, wake lead, proxy connection-hold timeout, and provider cutover/upstream readiness timeout.
 - Validate:
   - scale-to-zero requires an AWS or Google Cloud cluster using the `recommended` seed;
@@ -270,11 +271,11 @@
 ### Phase 2: Generate infrastructure and Nstance/vmconfig inputs
 - Generalize Terraform generation to AWS and Google Cloud module sources with equivalent topology inputs.
 - Emit Cloud Managed versus Podplane Managed NAT resources without changing node-subnet identity.
-- Generate one `/26` per node placement subnet and the top-level tenant-keyed Nstance `nat` configuration, including the dedicated group reference, tenant-owned `network_identity_pool`, `last_node_grace_period`, ordered `instance_type_ladder`, thresholds and windows, cooldown, replacement timeout, and small-cluster settings. Generate the referenced group's deployment template and starting `instance_type`, plus the `nat` vmconfig manifest references.
+- Generate one `/26` per node placement subnet and the top-level tenant-keyed Nstance `nat` configuration, including the group reference, tenant-owned `network_identity_pool`, `last_node_grace_period`, ordered `instance_type_ladder`, thresholds and windows, cooldown, and replacement timeout. Generate the referenced group's deployment template and starting `instance_type`, plus the `nat` vmconfig manifest references.
 - Generate provider-specific load-balancer metadata in the frozen Nstance configuration shape, including all production and Nstance-server subnets required for Google NEGs. Preserve each Google forwarding-rule destination IP and its single equal frontend, proxy, and target port so Nstance can derive the finalized static listener map keys and destination-IP dispatch selectors.
-- Select and pin `knc`, `knd`, `nst`, and `nat` vmconfig manifests by architecture, and pass immutable install features to each userdata data source. Set the Cloudflare tunnel feature only for affected `knc`/`nst` VMs and traffic accounting only for affected `knc`/`knd` groups participating in guarded normal sleep.
-- Replace generic Nstance-server userdata with the `nst` vmconfig kind and pass optional proxy/tunnel configuration through generated environment/files.
-- Generate tunnel resources and secret delivery for Cloudflare without serializing credentials into normal Terraform values, process arguments, logs, or world-readable files.
+- Select and pin `knc`, `knd`, `nst`, and `nat` vmconfig manifests by architecture. Pass listener-derived active-connection ports only to affected `knc`/`knd` groups participating in guarded normal sleep; tunnel provider software remains in digest-pinned container images.
+- Replace generic Nstance-server userdata with the `nst` vmconfig kind and pass optional proxy settings plus the root-controlled provider-neutral `tunnels` block through generated deployment configuration.
+- Generate tunnel resources, immutable image references, and mounted secret/storage file sources for Cloudflare without serializing credentials into normal Terraform values, process arguments, logs, or world-readable files.
 - Configure the initial Cloudflare implementation as public HTTPS applications, with a hostname-scoped HTTP-to-HTTPS edge redirect and no port-80 tunnel origin.
 - Generate stable API/ingress endpoint outputs:
   - NLB API defaults to external port 6443 and embeds the Kubernetes CA;
@@ -326,12 +327,7 @@
 - Update user docs for cost/availability tradeoffs, Cloudflare trust, NAT connection resets, force-sleep risk, and rollback.
 **Exit gate:** forced sleep passes the staged AWS and Google Cloud rollout, Cloudflare API wake provides administrative recovery, deployment plans preserve production routing and Kubernetes nodes where supported, and automatic sleep remains gated off pending the final matrix.
 ## Repository: `podplane/terraform-provider-podplane`
-### Phase 1: Add feature-aware userdata rendering
-- Add an optional set of immutable install features to `podplane_userdata` and pass it into the shared Podplane userdata renderer.
-- Include selected features in deterministic rendered content and state so changing tunnel or traffic-accounting requirements changes the VM configuration hash and rotates affected VMs.
-- Filter manifest downloads/checksums with the shared `ItemFilter`; reject unknown features and dependencies whose feature/kind metadata cannot match the selected VM.
-**Exit gate:** data-source tests prove identical manifests include `cloudflared` and `bpftool` only when their respective features are selected, remain deterministic, and preserve existing provider filters.
-### Phase 2: Add state-safe Nstance operator seed bootstrap
+### Phase 1: Add state-safe Nstance operator seed bootstrap
 - Add a state-safe signing-key resource that conditionally creates Nstance's registration key in its encrypted secrets store or adopts the existing key after an interrupted apply/Nstance lazy initialization. State contains only backend identity, version, and hash; updates never rotate the key automatically.
 - Make the existing Netsy seed resource depend on the signing-key resource and boundedly wait for Nstance's public `ca.crt`.
 - In the seed resource's Create operation only, read and decrypt the signing key into memory and use Nstance's public `pkg/nonce` contract to mint the 30-minute tenant- and cluster-scoped nonce JWT. Inject the nonce Secret and CA ConfigMap and upload the completed cluster-specific seed without intermediate plaintext files.

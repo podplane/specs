@@ -12,7 +12,7 @@ Podplane can use either Cloud Managed NAT or Podplane Managed NAT VMs without ch
     - Nstance conservatively calculates usable capacity as the subnet size minus AWS's five reserved addresses on both providers. It fills each sorted subnet to 90% of that capacity before using the next, targeting 53 nodes for `/26`.
     - Once all configured subnets are at 90%, it should round-robin until it finds an available slot.
     - As you will learn, this will reduce the total number of required Podplane Managed NAT instances.
-- Each populated node subnet has one NAT next hop. One configured subnet may optionally use the elected shard leader; other subnets use dedicated NAT VMs in a public/NAT service subnet in the same zone.
+- Each populated node subnet has one dedicated NAT VM in a public/NAT service subnet in the same zone.
 - One generated Terraform variable selects `cloud-managed` or `podplane-managed` NAT. Reapplying changes Cloud Managed NAT resources, route configuration, Nstance configuration, and required NAT VMs; node-subnet definitions remain unchanged.
     - This means cluster operators can switch between Cloud Managed NAT and Podplane Managed NAT without any cluster node changes or rotations. Cloud Managed to Podplane Managed causes a temporary IPv4 egress outage while Nstance reconciles.
 
@@ -29,16 +29,16 @@ AWS gives each node subnet its own route table. Its default IPv4 route targets t
 
 Google Cloud has no subnet-associated route tables. In Podplane Managed mode, Nstance assigns a subnet-specific network tag to each node and maintains a tagged default route to the selected forwarding-enabled VM. In Cloud Managed mode, Terraform configures Cloud NAT for the node-subnet ranges instead.
 
-Terraform creates the route tables, Cloud Managed NAT resources, IAM permissions, and other static network configuration. Nstance updates routes only while they point to Podplane Managed NAT next hops, because it knows which shard leader or dedicated NAT VM is healthy.
+Terraform creates the route tables, Cloud Managed NAT resources, IAM permissions, and other static network configuration. Nstance updates routes only while they point to Podplane Managed NAT next hops, because it knows which dedicated NAT VM is healthy.
 
 Changing modes works as follows:
 
-- **Cloud Managed to Podplane Managed:** Terraform disables Cloud Managed NAT and updates Nstance configuration in one apply. Nstance then establishes the configured small-cluster or dedicated NAT next hops and installs the Podplane Managed routes. IPv4 egress is temporarily unavailable between the Terraform change and Nstance reconciliation.
-- **Podplane Managed to Cloud Managed:** Terraform creates and validates Cloud Managed NAT, then changes each node subnet to use it. Nstance subsequently observes that Podplane Managed NAT is no longer configured, disables small-cluster NAT, and terminates any tracked dedicated NAT VMs and releases their identities.
+- **Cloud Managed to Podplane Managed:** Terraform disables Cloud Managed NAT and updates Nstance configuration in one apply. Nstance then establishes the configured NAT next hops and installs the Podplane Managed routes. IPv4 egress is temporarily unavailable between the Terraform change and Nstance reconciliation.
+- **Podplane Managed to Cloud Managed:** Terraform creates and validates Cloud Managed NAT, then changes each node subnet to use it. Nstance subsequently observes that Podplane Managed NAT is no longer configured, terminates any tracked NAT VMs, and releases their identities.
 
 Nstance-server must retain provider API and object-storage access during the first transition. AWS uses its S3 gateway endpoint and an EC2 interface endpoint; Google Cloud uses Private Google Access, which is already enabled on managed subnets. These paths do not provide general internet access.
 
-IPv6 is not translated and retains its existing provider-specific routing.
+Native IPv6 retains its existing provider-specific routing. The `nat` VM may additionally provide stateful NAT64 for explicitly allowed IPv6 source ranges; this does not replace native IPv6 routing.
 
 ## Nstance NAT group
 
@@ -76,41 +76,29 @@ Each shard's Nstance configuration identifies at most one NAT group per tenant t
     "scale_up_window": "3m",
     "scale_down_window": "25m",
     "cooldown": "10m",
-    "replacement_timeout": "10m",
-    "small_cluster": {
-      "initial_subnet": "nodes-0",
-      "max_instances": 10
-    }
+    "replacement_timeout": "10m"
   }
 }
 ```
 
-The map key is the tenant. Optional `group` references the dedicated NAT group under `groups[tenant]`; `small_cluster` configures small-cluster NAT. A missing tenant entry disables Podplane Managed NAT for that tenant. At least one mechanism must be configured, and invalid references are configuration errors. The singular `group` reference makes multiple dedicated NAT groups for one tenant unrepresentable.
+The map key is the tenant. Required `group` references the NAT group under `groups[tenant]`. A missing tenant entry disables Podplane Managed NAT for that tenant. Invalid references are configuration errors. The singular `group` reference makes multiple NAT groups for one tenant unrepresentable.
 
 `nat.<tenant>` owns `network_identity_pool`, `last_node_grace_period`, `instance_type_ladder`, scale-up and scale-down thresholds and windows, `cooldown`, and `replacement_timeout`. The referenced group owns only deployment settings such as its template and starting `instance_type`. The ladder is ordered from lowest to highest capacity and must contain that starting instance type. `network_identity_pool` names the provider-neutral stable network identities available to dedicated NAT replacements: ENIs and their addresses on AWS, or reserved internal and external addresses on Google Cloud.
 
-`last_node_grace_period` defaults to ten minutes and must be positive. A dedicated group requires `network_identity_pool`, and the pool cannot be specified without a dedicated group. Its ladder must be nonempty and cannot contain empty or duplicate instance types. Omitted threshold objects receive their complete defaults; a supplied object must specify valid values for every threshold. Utilization percentages must be greater than zero and no more than 100, with each scale-down threshold below its scale-up threshold. Packet-drop thresholds must be non-negative, with the scale-down threshold below the scale-up threshold.
+`last_node_grace_period` defaults to ten minutes and must be positive. `network_identity_pool` is required. The ladder must be nonempty and cannot contain empty or duplicate instance types. Omitted threshold objects receive their complete defaults; a supplied object must specify valid values for every threshold. Utilization percentages must be greater than zero and no more than 100, with each scale-down threshold below its scale-up threshold. Packet-drop thresholds must be non-negative, with the scale-down threshold below the scale-up threshold.
 
-When configured, the referenced group has one derived instance per populated tenant node subnet not served by small-cluster NAT, rather than a fixed desired count. It is excluded from MachinePool import and replica distribution. Each derived member stores its subnet, instance type, route state, and lifecycle. Group `size` is rejected; `instance_type` is the starting/default size for each derived member.
+When configured, the referenced group has one derived instance per populated tenant node subnet, rather than a fixed desired count. It is excluded from MachinePool import and replica distribution. Each derived member stores its subnet, instance type, route state, and lifecycle. Group `size` is rejected; `instance_type` is the starting/default size for each derived member.
 
 When placing a node, Nstance must:
 
 1. select its subnet;
-2. ensure that subnet's shard-leader or dedicated NAT next hop is healthy;
+2. ensure that subnet's NAT next hop is healthy;
 3. ensure the subnet route targets it;
 4. only then create the node.
 
 Groups may span multiple subnets, so this dependency is evaluated from actual instance placement, not group configuration. Subnets using tenant-owned NAT cannot be shared with another tenant's NAT group because their routes would conflict. When the final dependent node leaves a non-NAT subnet, Nstance removes its NAT instance after the tenant's configured grace period. Putting a tenant to sleep in a shard includes its local NAT group, but Nstance terminates nodes before their NAT dependencies. Reconciling that shard back to awake uses the reverse order.
 
 Nstance-server owns route mutation while Podplane Managed NAT is active. Provider permissions must be limited to the cluster's route and NAT resources to keep that security boundary narrow.
-
-## Small-cluster NAT
-
-`small_cluster.max_instances > 0` enables small-cluster NAT. `initial_subnet` is reserved for this tenant's first instances and excluded from every other placement path. Nstance fills it first up to `max_instances`. If a dedicated `group` is configured, additional populated subnets use dedicated NAT VMs; otherwise placement blocks at the limit.
-
-Every Nstance-server candidate in the shard is configured by the `nst` vmconfig kind for IP forwarding and source NAT. AWS disables source/destination checks; Google Cloud enables `can_ip_forward`. The elected leader uses its external IPv4 for egress. On leadership change, Nstance activates forwarding on the new leader and changes the node-subnet route before retiring the old path.
-
-Small-cluster NAT has no stable egress-IP guarantee, automatic vertical scaling, or conntrack transfer. Leadership changes may change the public IPv4 and reset established connections. It is an optional cost optimization bounded by `max_instances`.
 
 ## NAT VM configuration
 
@@ -119,17 +107,20 @@ Small-cluster NAT has no stable egress-IP guarantee, automatic vertical scaling,
 The kind configures:
 
 - IP forwarding and source NAT;
+- optional stateful Jool NAT64, defaulting to the well-known `64:ff9b::/96` prefix;
 - Nstance agent health/config reporting;
 - conntrack limits and metrics;
 - current CPU and memory metrics;
 - cumulative byte, packet, and drop counters for one explicitly configured network interface;
 - Fluent Bit and the standard vmconfig receive/reconfigure workflow.
 
+NAT64 requires an IPv6 source allowlist and an IPv4 pool address. Translation to non-global IPv4 destinations is blocked by default. A custom `/96` prefix must provide a matching blocked-prefix list. Jool userspace comes from Debian, while signed modules are pinned to and verified against the exact Debian guest kernel before forwarding starts. The `nat` image contains no containerd, kubelet, container-runtime users, runtime images, configuration, or services.
+
 The interface name is passed to nstance-agent as `NSTANCE_METRICS_INTERFACE`. Omitting it disables interface and conntrack collection. Each report contains one current metrics observation; the server derives throughput, packet, and drop rates from consecutive timestamped reports. Collection failures are reported explicitly rather than represented as zero values.
 
 ## Vertical scaling
 
-Each dedicated NAT instance scales vertically using A/B deployments; small-cluster NAT does not. Nstance does not add parallel NAT instances for the same subnet, as AWS does not support this.
+Each NAT instance scales vertically using A/B deployments. Nstance does not add parallel active NAT instances for the same subnet, as AWS does not support this.
 
 Nstance-server evaluates:
 
@@ -159,8 +150,8 @@ A route switch does not transfer conntrack state between NAT VMs, so vertical re
 ## Implementation areas
 
 - **Nstance:** NAT-group configuration, subnet dependencies, provider route APIs, metrics, vertical replacement, tenant sleep/wake, and least-privilege permissions.
-- **vmconfig:** `nat` kind plus optional NAT forwarding in the `nst` kind.
+- **vmconfig:** `nat` kind.
 - **Podplane CLI:** NAT mode/config validation, manifest selection, and generated Terraform.
 - **Nstance Terraform modules:** stable subnet model plus provider-specific Cloud Managed and Podplane Managed NAT resources.
 
-Tests must cover omitted and invalid NAT mechanisms, small-cluster-only and small-cluster-plus-group modes, leader election and route changes, initial-subnet reservation/capacity, cross-tenant subnet conflicts, concurrent node creation, NAT-first startup, last-node grace periods, sleep/wake, failed NAT health, identity-pool exhaustion, replacement cooldown, and provider-specific cutover.
+Tests must cover omitted and invalid NAT configuration, route changes, subnet capacity, cross-tenant subnet conflicts, concurrent node creation, NAT-first startup, last-node grace periods, sleep/wake, failed NAT health, identity-pool exhaustion, replacement cooldown, and provider-specific cutover.

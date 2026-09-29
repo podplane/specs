@@ -12,7 +12,7 @@ Scale-to-zero should feel like **Wake-on-LAN for Kubernetes**. Podplane may stop
 
 Nstance Server VMs remain running by default, normally one per zone/shard. They can use very small instance types because they provide the durable control plane while Kubernetes is asleep.
 
-They remain in private service subnets by default. Podplane Managed NAT places them in public service subnets/direct external egress as described in [NAT.md](./NAT.md), allowing tunnels and optional small-cluster NAT to remain available while tenant groups are asleep. Changing this placement may rotate Nstance Server VMs but never Kubernetes nodes.
+They remain in private service subnets by default. Podplane Managed NAT places them in public service subnets/direct external egress as described in [NAT.md](./NAT.md), allowing tunnels to remain available while tenant groups are asleep. Changing this placement may rotate Nstance Server VMs but never Kubernetes nodes.
 
 ## Durable tenant state
 
@@ -37,18 +37,18 @@ Nstance adds idempotent operations:
 - `SleepTenant`: its request carries `tenant`, `if_not_busy`, and optional `wake_at`; its response returns `SLEPT`, `ALREADY_ASLEEP`, or `BUSY`, the current `AWAKE` or `ASLEEP` status, and the effective optional `wake_at`;
 - `WakeTenant`: its request carries `tenant` and an optional listener identity; its response returns `WOKE` or `ALREADY_AWAKE`, the current status, and an optional ready upstream. A listener-scoped wake waits for and returns an upstream, while an unscoped compensation wake does not require one.
 
-This includes the tenant's configured NAT group in that shard. On wake, normal reconciliation restores desired sizes; NAT dependencies ensure required NAT instances become healthy before nodes launch. `nstance-proxy` uses configured listener-to-group mappings and needs no previous-size knowledge.
+This includes the tenant's configured NAT group in that shard. On wake, normal reconciliation restores desired sizes; NAT dependencies ensure required NAT instances become healthy before nodes launch. `nstance-server proxy` uses configured listener-to-group mappings and needs no previous-size knowledge.
 
 The shard leader reconciles its local record and resumes unfinished work after leadership changes. Nstance does not coordinate tenant sleep state through the cluster leader or contact other shards. On AWS, shard leaders independently enable the shared target groups' cross-zone setting before sleep; the cluster leader coordinates only safely disabling it again as described in [LB.md](./LB.md). This does not change shard-local tenant state ownership.
 
-Local wake-tunnel ownership is deliberately ephemeral rather than part of durable tenant state. On shard leadership loss, the old leader's `nstance-tunnel` control stream closes and the supervisor stops its wake endpoint. The new leader sends a fresh named identity and revision over its local supervisor stream and waits for matching readiness before continuing destructive reconciliation. An asleep shard can therefore have a brief wake-path interruption during leader failover; Nstance does not maintain a distributed old/new-leader tunnel handoff or lifecycle state files.
+Local wake-tunnel ownership is deliberately ephemeral rather than part of durable tenant state. The privileged root `nstance-server tunnel` process initiates its local Unix gRPC stream to the unprivileged server process, independently reads the same root-controlled shard configuration, and resolves tunnel secret/storage files itself. The shard leader sends only allowlisted tunnel name, desired running/stopped state, revision, and a renewable lease; it never sends images, commands, mounts, manifests, secrets, or provider details. Heartbeats renew authority while leadership is held. Explicit leadership loss revokes immediately; an ambiguous disconnect retains current state only for the bounded lease while reconnecting, then stops fail-closed. A restarted supervisor removes stale manifests before loading configuration because its leases were lost. The new leader waits for matching revision readiness before continuing destructive reconciliation. Nstance maintains no distributed old/new-leader tunnel handoff or lifecycle state files.
 
 ## Supported topologies
 
 Nstance sleep/wake is not limited by node count:
 
-- **One node to zero:** the shard preserving that node's desired size advertises `nstance-proxy`; a request wakes that shard.
-- **Two nodes to zero across two zones:** each shard preserves one desired node and advertises `nstance-proxy`. A request wakes whichever shard receives it; once Kubernetes starts, nstance-operator restores the other shard. Concurrent requests may wake both shards, which is safe.
+- **One node to zero:** the shard preserving that node's desired size advertises `nstance-server proxy`; a request wakes that shard.
+- **Two nodes to zero across two zones:** each shard preserves one desired node and advertises `nstance-server proxy`. A request wakes whichever shard receives it; once Kubernetes starts, nstance-operator restores the other shard. Concurrent requests may wake both shards, which is safe.
 
 Shards do not advertise a listener's wake target when its configured group has preserved size zero because waking that shard would not restore the listener's upstream.
 Nstance supports both scenarios; the initial nstance-operator automatic policy permits only the first, while forced sleep can use either.
@@ -69,15 +69,15 @@ Exactly one node is the initial default, not an Nstance limitation. nstance-oper
 
 The all-shard operation is compensating rather than atomic. If any shard rejects or fails after another shard has durably committed sleep, nstance-operator durably calls `WakeTenant` for every shard that already accepted the request. It retains the sleep-request annotation and retries compensation until every affected shard's sleep entry has been removed; only then does it emit the rejection Event and remove the annotation. An operator restart resumes the same compensation from the annotation and observed shard state. This prevents a failed sleep request from leaving part of the cluster indefinitely asleep.
 
-## Traffic activity
+## eBPF port activity monitoring
 
 External kube-apiserver exposure remains direct and never depends on Envoy Gateway.
 
-Each Kubernetes group that can participate in guarded normal sleep uses eBPF to count active TCP connections on every production target port derived from its referenced `load_balancers` listeners. vmconfig configures ingress ports only, kube-apiserver port 6443 only, their union for a group serving both roles, or no accounting for a group serving neither role. Standard NLB ingress therefore counts ports 80 and 443, while tunnel ingress counts port 443. This listener-derived configuration supports shared or separate control-plane and ingress groups without duplicating the port model in role configuration.
+Each Kubernetes group that can participate in guarded normal sleep uses eBPF to count active TCP connections on every production target port derived from its referenced `load_balancers` listeners. vmconfig configures ingress ports only, kube-apiserver port 6443 only, their union for a group serving both roles, or no counters for a group serving neither role. Standard NLB ingress therefore counts ports 80 and 443, while tunnel ingress counts port 443. This listener-derived configuration supports shared or separate control-plane and ingress groups without duplicating the port model in role configuration.
 
 ### Loading and pinning
 
-For groups requiring accounting, vmconfig installs Debian's `bpftool` and a root-owned systemd oneshot service. The service loads the vmconfig-supplied ELF, ignores ports outside the listener-derived set, infers tracepoint attachments from section names, uses `autoattach` to pin the resulting BPF links, and uses `pinmaps` to pin maps separately:
+For groups requiring active connection counters, vmconfig installs Debian's `bpftool` and a root-owned systemd oneshot service. The service loads the vmconfig-supplied ELF, ignores ports outside the listener-derived set, infers tracepoint attachments from section names, uses `autoattach` to pin the resulting BPF links, and uses `pinmaps` to pin maps separately:
 
 ```text
 /sys/fs/bpf/nstance/counters/
@@ -86,7 +86,7 @@ For groups requiring accounting, vmconfig installs Debian's `bpftool` and a root
     └── active_connections
 ```
 
-Both links and maps are pinned: maps remain readable independently, while links keep programs attached after bpftool exits. The service grants nstance-agent read access only to the pins it must validate and the counter map. nstance-agent remains unprivileged and never loads or modifies BPF objects. When accounting is disabled, vmconfig does not fetch or install `bpftool`, enable the loader, attach programs, create pins, or configure agent collection.
+Both links and maps are pinned: maps remain readable independently, while links keep programs attached after bpftool exits. The service grants nstance-agent read access only to the pins it must validate and the counter map. nstance-agent remains unprivileged and never loads or modifies BPF objects. vmconfig installs the small active-connection counter toolchain on every Kubernetes node, but when no production ports require monitoring it does not enable the loader, attach programs, create pins, or configure agent collection.
 
 ### Agent reporting
 
@@ -133,15 +133,15 @@ Any Job without terminal `Complete` or `Failed` status blocks sleep; deleting Jo
 
 Wake is deduplicated within a shard by a durable compare-and-swap that removes the tenant's sleep entry. The first network or timer trigger performs the transition; concurrent triggers observe that the entry is already absent and succeed idempotently.
 
-1. `nstance-proxy` invokes the local, listener-scoped `WakeTenant` operation and holds the connection.
+1. `nstance-server proxy` invokes the local, listener-scoped `WakeTenant` operation and holds the connection.
 2. Nstance removes the tenant's sleep entry and reconciles local infrastructure toward awake.
 3. Required NAT instances become healthy before dependent nodes.
 4. Nstance waits for any configured group to provide an agent-healthy instance with the target port ready, then returns its private address.
-5. `nstance-proxy` forwards held connections to that address.
+5. `nstance-server proxy` forwards held connections to that address.
 6. Once Kubernetes starts, nstance-operator wakes any other shards required by MachinePools.
-7. Nstance waits for production NLB targets to become provider-health-check healthy and routable. For tunnel exposure, it waits for ordinary fresh control-plane agent health and the requested upstream TCP port; the production tunnel itself is intrinsic to vmconfig and is not reported to Nstance. It then bypasses `nstance-proxy`, allowing existing proxied connections to finish there. If readiness times out, it retains the proxy path and continues reconciliation. For the local `nst` wake tunnel, Nstance exchanges only named identity/revision desired state and status with the least-privileged `nstance-tunnel` supervisor over its separate Unix gRPC socket.
+7. Nstance waits for production NLB targets to become provider-health-check healthy and routable. For tunnel exposure, it waits for ordinary fresh control-plane agent health and the requested upstream TCP port; production control-plane tunnels remain VM-lifecycle-owned and outside Nstance control. It then bypasses `nstance-server proxy`, allowing existing proxied connections to finish there. If readiness times out, it retains the proxy path and continues reconciliation. For the local `nst` wake tunnel, Nstance renews only the allowlisted name, desired running/stopped state, revision, and bounded lease over the supervisor-initiated Unix gRPC stream.
 
-The local `nstance-proxy` uses one root-owned, proxy-accessible Unix gRPC control socket for its versioned listener stream and listener-scoped `WakeTenant`; these are the only proxy-facing operations. On stream loss it retains the last valid snapshot only during a brief reconnect window and stops leader-owned work. Nstance-server remains inaccessible from the public network, and no proxy configuration is persisted.
+The local `nstance-server proxy` uses one root-owned, proxy-accessible Unix gRPC control socket for its versioned listener stream and listener-scoped `WakeTenant`; these are the only proxy-facing operations. On stream loss it retains the last valid snapshot only during a brief reconnect window and stops leader-owned work. Nstance-server remains inaccessible from the public network, and no proxy configuration is persisted.
 
 ## Operator registration bootstrap
 
@@ -162,16 +162,16 @@ podplane cluster sleep --force
 
 The command uses `SelfSubjectAccessReview` to verify that the user may patch the CAPI `Cluster`, then writes `nstance.dev/sleep-request=<timestamp>` or `force:<timestamp>` and disconnects immediately. nstance-operator calls `SleepTenant` for every shard and removes the annotation after all requests are durable. On rejection after a partial commit, it first completes the durable all-shard compensation described above, then emits a Kubernetes Event and removes the annotation. If the operator restarts first, the remaining annotation causes a safe retry or resumes compensation. Initially this is limited to `podplane:admins`, which are bound to `cluster-admin`; nstance-operator requires CAPI Cluster get/list/watch/patch/update permissions.
 
-Normal sleep applies the automatic-sleep guards. `--force` bypasses node-count, pending-scale, Job, CronJob, and traffic checks after explicit confirmation, but still requests orderly shutdown and warns that active workloads and connections can be interrupted. There is no wake command: any kubectl, Helm, kube-apiserver, or ingress request reaches `nstance-proxy` and wakes a shard.
+Normal sleep applies the automatic-sleep guards. `--force` bypasses node-count, pending-scale, Job, CronJob, and traffic checks after explicit confirmation, but still requests orderly shutdown and warns that active workloads and connections can be interrupted. There is no wake command: any kubectl, Helm, kube-apiserver, or ingress request reaches `nstance-server proxy` and wakes a shard.
 
 ## Implementation areas
 
 - **Nstance operator:** configurable Kubernetes eligibility, Job/CronJob evaluation, wake deadlines, all-shard sleep ordering, and post-wake MachinePool restoration.
 - **Nstance server:** durable per-tenant shard state, timers, final busy check, local reconciliation, and narrow proxy/supervisor Unix gRPC control streams.
-- **Nstance tunnel supervisor:** least-privileged local wake-tunnel lifecycle, readiness/failure status, restart/backoff, and stream-loss cleanup.
+- **Nstance tunnel supervisor:** privileged root config/file resolution, supervisor-initiated control stream, renewable-lease enforcement, hardened kubelet static-Pod generation, and readiness/restart handling.
 - **Nstance agent:** read-only pinned-map collection and eBPF counter/error reporting.
-- **vmconfig:** optional `knc`/`knd` BPF accounting, bpftool oneshot loader, pin permissions, intrinsic production `knc` tunnels, `nst` kind, installation/configuration/hardening of optional `nstance-proxy` and `nstance-tunnel`, tunnel clients, and secret receive watchers.
+- **vmconfig:** dormant-by-default `knc`/`knd` eBPF connection counters, bpftool oneshot loader, pin permissions, VM-lifecycle-owned production `knc` tunnels, `nst` kind, and installation/hardening of separate optional `nstance-server proxy` and `nstance-server tunnel` processes.
 - **Podplane CLI:** generated sleep policy and the annotation-based sleep command.
 - **Components:** deploy/configure nstance-operator and the required operator permissions.
 
-Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, durable compensation when a later shard rejects or fails, operator restart during compensation, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, listener-derived port sets including NLB ingress port 80, zero, nonzero, absent, failed, and stale eBPF reports, traffic during production-target draining, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, Unix stream reconnect and snapshot replacement, in-place listener reconciliation, supervisor stream closure, tunnel readiness/failure and process restart/backoff, least privilege, absence of lifecycle state files, forced sleep, NAT dependencies, signing-key/seed create-or-adopt after interrupted applies, signing-key reads only during seed creation, lost registration responses, and bootstrap Secret deletion after durable certificate storage.
+Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, durable compensation when a later shard rejects or fails, operator restart during compensation, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, listener-derived port sets including NLB ingress port 80, zero, nonzero, absent, failed, and stale eBPF reports, traffic during production-target draining, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, Unix stream reconnect and snapshot replacement, in-place listener reconciliation, supervisor-initiated reconnect, heartbeat renewal, immediate explicit revocation, bounded ambiguous-disconnect behavior, fail-closed lease expiry, hardened static Pods, dedicated and shared-agent tunnel layouts, absence of provider details in Nstance messages, absence of lifecycle state files, forced sleep, NAT dependencies, signing-key/seed create-or-adopt after interrupted applies, signing-key reads only during seed creation, lost registration responses, and bootstrap Secret deletion after durable certificate storage.
