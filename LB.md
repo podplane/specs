@@ -25,11 +25,11 @@ Nstance registers agent-healthy instances with AWS target groups or Google Cloud
 
 ## Scale-to-zero proxy
 
-When Podplane sleep support is enabled, vmconfig enables a separate, minimal `nstance-server proxy` systemd service on every `nst` (nstance-server) VM using a generated environment setting. The service remains running while the tenant is awake and asleep; Nstance changes routing, not its process lifecycle. Without sleep support enabled, vmconfig does not enable it. The nstance-server control-plane process is never publicly exposed.
+For supported AWS/Google clusters using the `recommended` seed, Podplane generates wake-capable routing and vmconfig enables a separate, minimal `nstance-server proxy` systemd service on every `nst` (nstance-server) VM using a generated environment setting. This requires no Podplane sleep-policy flag and does not enable automatic sleep. The service remains running while the tenant is awake and asleep; Nstance changes routing, not its process lifecycle. Deployments without sleep support leave the optional service disabled. Nstance/operator defaults own policy and timing; Podplane generates no overrides. The nstance-server control-plane process is never publicly exposed.
 
 Each shard leader manages its configured proxy listeners. While a local tenant is asleep, a listener whose group has nonzero preserved size routes NLB or tunnel traffic to the local `nstance-server proxy`; a zero-sized group does not advertise that wake target. After a shard leadership change, the new leader installs its routes and the old leader removes or disarms its routes; no server-to-server forwarding is required.
 
-When a cluster goes to sleep, Nstance changes each configured proxy listener's external traffic path to `nstance-server proxy` before removing its final production targets. The proxy:
+When a tenant goes to sleep in a shard, Nstance changes each configured proxy listener's shard-local external traffic path to `nstance-server proxy` before removing that shard's final production targets. The proxy:
 
 1. accepts and holds connections for a configurable, long bounded timeout;
 2. invokes blocking `WakeTenant(listener)` through the shared root-owned, proxy-accessible Unix gRPC control socket;
@@ -102,7 +102,7 @@ A tunnel entry in the nstance-server configuration file names only production an
 
 Generated runtime listener keys use `<load-balancer-key>:<proxy-port>`. A tunnel load balancer references an allowlisted name from the separate provider-neutral `tunnels` block described below; it does not embed provider configuration.
 
-Each logical load balancer may be referenced by any number of groups within exactly one tenant. Their instances form its combined backend set, and `nstance-server proxy` forwards to any healthy instance among them. Groups requiring different membership use separate logical load-balancer keys; the existing group `load_balancers` list is unchanged. AWS requires a distinct `proxy_port` for each listener sharing an `nst` VM because the backend sees the VM address, not the NLB address. Google Cloud passthrough frontends may share a local port because the proxy can dispatch by the preserved forwarding-rule destination IP.
+Each logical load balancer may be referenced by any number of groups within exactly one tenant. Their instances form its combined backend set, and `nstance-server proxy` forwards to any healthy instance among them. Groups requiring different membership use separate logical load-balancer keys; the existing group `load_balancers` list is unchanged. AWS requires a distinct `proxy_port` for each listener sharing an `nst` VM because the backend sees the VM address, not the NLB address. Google Cloud passthrough frontends may share a local port because the proxy can dispatch by the preserved forwarding-rule frontend IP.
 
 At startup and configuration reload, nstance-server derives the following runtime listener snapshot from `load_balancers` and group references and streams it to `nstance-server proxy`. This is not an nstance-server configuration-file fragment:
 
@@ -120,9 +120,9 @@ At startup and configuration reload, nstance-server derives the following runtim
 }
 ```
 
-Listener identity is the key in the `listeners` map and is not duplicated in the listener value. AWS and tunnel identities use `<load-balancer-key>:<proxy-port>`. A Google listener uses `<load-balancer-key>:<port>` when its port is unique across configured Google frontends. When the port is shared, its identity uses `<load-balancer-key>/<destination-ip>:<port>` and `destination_ip` is included in the listener value. Standard host-and-port formatting keeps IPv6 identities unambiguous.
+Listener identity is the key in the `listeners` map and is not duplicated in the listener value. AWS and tunnel identities use `<load-balancer-key>:<proxy-port>`. A Google listener uses `<load-balancer-key>:<port>` when its port is unique across configured Google frontends. When the port is shared, its identity uses `<load-balancer-key>/<frontend-ip>:<port>` and `frontend_ip` is included in the listener value. Standard host-and-port formatting keeps IPv6 identities unambiguous.
 
-The following is another generated runtime listener snapshot rather than an nstance-server configuration-file fragment. It shows two Google Cloud frontends sharing port 443 and therefore requiring destination-IP dispatch:
+The following is another generated runtime listener snapshot rather than an nstance-server configuration-file fragment. It shows two Google Cloud frontends sharing port 443 and therefore requiring frontend-IP dispatch:
 
 ```jsonc
 // derived configuration provided to nstance-server proxy
@@ -130,14 +130,14 @@ The following is another generated runtime listener snapshot rather than an nsta
   "listeners": {
     "control-plane/34.10.20.30:443": {
       "proxy_port": 443,
-      "destination_ip": "34.10.20.30",
+      "frontend_ip": "34.10.20.30",
       "tenant": "default",
       "groups": ["control-plane"],
       "target_port": 443
     },
     "ingress/34.10.20.31:443": {
       "proxy_port": 443,
-      "destination_ip": "34.10.20.31",
+      "frontend_ip": "34.10.20.31",
       "tenant": "default",
       "groups": ["ingress"],
       "target_port": 443
@@ -146,23 +146,21 @@ The following is another generated runtime listener snapshot rather than an nsta
 }
 ```
 
-The listener snapshot contains no provider resources or dynamic upstream addresses. AWS uses the configured `proxy_port` as the target-registration port override. A Google frontend's single `port` supplies its frontend, proxy, and target ports; duplicate destination-IP and port selectors are rejected.
+The listener snapshot contains no provider resources or dynamic upstream addresses. AWS uses the configured `proxy_port` as the target-registration port override. A Google frontend's single `port` supplies its frontend, proxy, and target ports; duplicate frontend-IP and port selectors are rejected.
 
-Both processes use the shared `pkg/proxy` configuration structs. Each listener value contains only `tenant`, `groups`, `target_port`, `proxy_port`, and optional `destination_ip`. All communication between nstance-server and `nstance-server proxy` uses one root-owned, proxy-accessible Unix gRPC control socket. Its versioned service exposes only a versioned initial-and-replacement listener-configuration stream and listener-scoped `WakeTenant`; it carries no secrets, commands, provider-specific configuration, or dynamic membership state.
+Both processes use the shared proxy configuration structs. Each listener value contains only `tenant`, `groups`, `target_port`, `proxy_port`, and optional `frontend_ip`. All communication between nstance-server and `nstance-server proxy` uses one root-owned, proxy-accessible Unix gRPC control socket. Its versioned service exposes only a versioned initial-and-replacement listener-configuration stream and listener-scoped `WakeTenant`; it carries no secrets, commands, provider-specific configuration, or dynamic membership state.
 
 `nstance-server proxy` waits for the initial listener snapshot before serving, validates each complete replacement, and reconciles listener changes in place without disrupting unchanged listeners. During a brief control-stream disconnect it retains the last valid snapshot while reconnecting, but immediately stops leader-owned work; a prolonged disconnect makes the proxy unavailable rather than extending stale authority. No proxy configuration state is written to disk.
 
 `WakeTenant(listener)` validates the listener, idempotently wakes its tenant, waits for an agent-healthy instance from any configured group and for `target_port` readiness, then returns one private `IP:target_port`. This and the listener stream are the only proxy-facing operations. `nstance-server proxy` understands no provider APIs, Kubernetes, kube-apiserver, or Envoy Gateway.
 
-Every derived listener is a wake trigger and activity source. Validation rejects cross-tenant references, invalid ports, duplicate Google Cloud destination-IP and port selectors, collisions with nstance-server ports, and any reuse of an AWS or tunnel proxy port, including by a Google listener.
+Every derived listener is a wake trigger and activity source. Validation rejects cross-tenant references, invalid ports, duplicate Google Cloud frontend-IP and port selectors, collisions with nstance-server ports, and any reuse of an AWS or tunnel proxy port, including by a Google listener.
 
 ## Network Load Balancers
 
 Podplane-generated Terraform supports equivalent AWS and Google Cloud behavior using provider-native resources. A `load_balancers` key is a logical set of backends with common membership, not necessarily a physical load balancer.
 
-AWS uses one regional target group per listener, shared by all shards and Availability Zones, and may send production and `nstance-server proxy` traffic to different target ports through a registration override. Cross-zone load balancing is disabled on these target groups during normal awake operation. Because a sleeping tenant may have a wake-capable proxy target in only one shard, the shard leader beginning sleep idempotently enables cross-zone load balancing on all of its target groups and waits for provider confirmation before withdrawing production targets.
-
-Enabling cross-zone load balancing requires no cluster-wide coordination because concurrent enable operations are idempotent. The Nstance cluster leader coordinates only its re-disablement: after Kubernetes is awake, production routing has been restored, and proxy targets have been removed in every shard, it disables cross-zone load balancing on all target groups. This decision is serialized against new sleep transitions so the cluster leader cannot disable the setting after a shard has enabled it for sleep. Cross-zone control requires `elasticloadbalancing:ModifyTargetGroupAttributes` scoped to the configured target groups; shard leaders continue to own only their local target membership.
+AWS uses one regional target group per listener, shared by all shards and Availability Zones, and may send production and `nstance-server proxy` traffic to different target ports through a registration override. OpenTofu/Terraform keeps cross-zone load balancing disabled on both the NLB and its target groups. Each NLB node therefore selects healthy targets in its own Availability Zone, and each shard installs its local wake-proxy target before withdrawing its local production targets. Nstance-server never changes cross-zone settings, enumerates other shards, or coordinates a cutover with them.
 
 Google Cloud uses `GCE_VM_IP` NEGs instead of unmanaged instance groups because a Compute Engine VM can belong to only one instance group. The same VM interface can be represented as an endpoint in multiple NEGs, and the same NEG can back multiple backend services. This allows one VM—particularly an Nstance proxy—to participate in multiple logical load balancers without coupling their membership. It also permits separate NEGs for Envoy ingress on port 443 and kube-apiserver traffic on port 6443, regardless of whether they are backed by one Nstance group or separate groups.
 
@@ -178,7 +176,9 @@ Sleep transition:
 4. if proxy payload arrived, a connection remains active, or a required report failed, restore production registration before deregistering `nstance-server proxy` and aborting;
 5. otherwise wait for production targets to finish deregistering, commit sleep, and terminate production instances.
 
-The final sleep decision and `WakeTenant` are serialized by the tenant transition lock. A proxy arrival either aborts pending sleep or, if sleep commits first, immediately wakes the tenant. Provider API acceptance alone is not the withdrawal barrier: the provider adapter must wait for the target or endpoint to finish draining and reach its fully deregistered state.
+Forced sleep (`if_not_busy=false`) retains steps 1 and 2 and waits for provider confirmation that production targets no longer receive new connections. It skips the activity check and remaining drain period, commits sleep, and begins instance termination; existing connections may be interrupted. Ordinary instance deletion still requires full deregistration. During committed sleep, confirmed draining targets may be terminated, but unknown or still-routable targets remain a deletion barrier. No shared target-group or backend-service settings are changed to accelerate forced sleep.
+
+The final sleep decision and `WakeTenant` are serialized by the tenant transition lock. A proxy arrival either aborts pending sleep or, if sleep commits first, immediately wakes the tenant. Provider API acceptance alone is not the withdrawal barrier: normal sleep requires fully deregistered targets, while forced sleep requires confirmed withdrawal from new-connection selection.
 
 Wake transition:
 
@@ -187,17 +187,13 @@ Wake transition:
 3. during this overlap, either path may serve traffic;
 4. deregister `nstance-server proxy` targets while allowing their active connections to drain.
 
-On AWS, the cluster leader disables target-group cross-zone load balancing only after step 4 has completed for the cluster. This ordering prevents an NLB node in an Availability Zone without a wake-capable target from losing its route during wake.
-
 nstance-server performs target membership changes because it already owns instance lifecycle and limits cloud API access to one security boundary. IAM permissions must be scoped to the cluster's target groups and NEGs; Google Cloud additionally grants the NEG read permission required to resolve each configured NEG's subnet.
 
 The design must account for provider fail-open behaviour and must never intentionally leave both production and proxy registration sets empty or rely on fail-open traffic as evidence that a target is ready during transition. `nstance-server proxy` health checks must not invoke `WakeTenant`; payload activity on production ports remains the sleep guard described in [ZERO.md](./ZERO.md).
 
 ## Nstance Server VM
 
-This will require customisation, where today Podplane uses the current nstance module default userdata.
-
-For `vmconfig` we add an `nst` kind instead of Nstance's generic server userdata. It installs nstance-server, Fluent Bit, optional separate `nstance-server proxy` and privileged `nstance-server tunnel` services, and the standard vmconfig configuration/watch machinery. Provider-specific tunnel software and generated configuration live in immutable container images and deployment configuration, not in Nstance or vmconfig code.
+The vmconfig `nst` kind replaces Nstance's generic server userdata. It installs nstance-server, Fluent Bit, optional separate `nstance-server proxy` and privileged `nstance-server tunnel` services, and the standard vmconfig configuration/watch machinery. Its containerd and Podplane Registry configuration matches `knd`, so tunnel static Pods can use the same S3-backed image distribution. Its standalone kubelet watches the standard `/etc/kubernetes/manifests` directory rather than a tunnel-specific path. Provider-specific tunnel software and generated configuration live in immutable container images and deployment configuration, not in Nstance or vmconfig code.
 
 Nstance Server VMs use private service subnets by default. Podplane Managed NAT always gives them internet access independent of the NAT group, which sleeps with the tenant:
 
@@ -235,7 +231,76 @@ Cloudflare tunnel processes using one credential provide availability but no tra
 
 The initial Cloudflare implementation uses public HTTPS applications, not Cloudflare's arbitrary-TCP client mode. Clients connect to Cloudflare's HTTPS edge on port 443 without `cloudflared`; Cloudflare terminates client TLS and sends HTTPS through the tunnel to kube-apiserver on local port 6443 or Envoy on local port 443. The `nst` wake tunnel process sends the same HTTPS origin traffic to local `nstance-server proxy`, which transparently forwards it to the selected production port after wake. Locally managed ingress rules allow the control-plane and `nst` tunnel processes to use these different local targets.
 
-Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and content. In tunnel mode, Podplane generates the kubeconfig API URL on external port 443 and relies on the operating system's public CA roots for the Cloudflare edge certificate instead of embedding the kube-apiserver CA. Cloudflare-to-origin connections remain TLS-protected. Generated deployment configuration gives the Cloudflare container the Podplane cluster CA and API hostname for the API route, and the configured ingress issuer CA or public roots and ingress hostname for ingress routes. TLS verification must not be disabled.
+Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and content. In tunnel mode, Podplane generates the kubeconfig API URL on external port 443 and relies on the operating system's public CA roots for the Cloudflare edge certificate instead of embedding the kube-apiserver CA. Cloudflare-to-origin connections remain TLS-protected. Generated deployment configuration gives both production and `nst` tunnel containers the existing Nstance cluster CA for API and ingress verification, with the API hostname or the matching ingress hostname as the expected origin identity. TLS verification must not be disabled.
+
+## Ingress certificates and SDS
+
+Certificate ownership follows the exposure mode:
+
+| Exposure | `cluster.acme` | Ingress certificate delivery |
+| --- | --- | --- |
+| Tunnel | Absent | Node-local Nstance-issued certificate through SDS |
+| Tunnel | Present | Configuration error |
+| NLB | Absent | Operator-managed self-signed per-domain bundles through CSI and SDS |
+| NLB | Present | Operator-managed self-signed fallback and ACME per-domain bundles through CSI and SDS |
+
+NLB certificate issuance, storage, and renewal retain [ACME.md](./ACME.md)'s contract. Tunnel mode instead uses the same node certificate provisioning mechanism as kube-apiserver: nstance-agent generates the private key locally, submits its public key, and receives a certificate signed by nstance-server using the existing cluster CA. No additional CA, cluster-leader certificate manager, signing API, or ingress private-key publication to the secrets backend is required.
+
+### Node-local tunnel ingress certificate
+
+Podplane generates one `ingress.server` server-certificate template and requests it on every `knc`/`knd` node eligible to run the Envoy DaemonSet, including control-plane nodes. Each node has one dedicated ingress keypair and certificate, shared by all of its ingress listeners. Different nodes have different keys; the ingress key is not reused for kube-apiserver or Nstance authentication.
+
+The certificate's DNS SANs contain every configured apex and its wildcard, plus `localhost`. Its IP SANs contain `127.0.0.1`, `::1`, and that Envoy node's assigned IPv4/IPv6 addresses, using the existing instance templates and omitting an address family when absent. Node addresses are IP SANs, not DNS SANs; they identify the upstream Envoy node, not the `nst` proxy. For `example.com` and `example.org`, the existing Nstance configuration shapes are:
+
+```jsonc
+"certificates": {
+  "ingress.server": {
+    "kind": "server",
+    "cn": "ingress.server",
+    "dns": ["example.com", "*.example.com", "example.org", "*.example.org", "localhost"],
+    "ip": ["{{ .Instance.IP4 }}", "{{ .Instance.IP6 }}", "127.0.0.1", "::1"],
+    "ttl": 8760
+  }
+},
+"templates": {
+  "knc": {
+    // Other node files and deployment settings omitted.
+    "files": {
+      "ingress.server.crt": {
+        "kind": "certificate",
+        "template": "ingress.server",
+        "key": {"source": "agent", "name": "ingress.server"}
+      }
+    }
+  }
+}
+```
+
+Equivalent file configuration applies to eligible `knd` templates. With no ingress domains or no Envoy role, no ingress key/certificate is requested. The certificate is a non-CA leaf with server-authentication usage only and no Nstance authentication role. SANs are required: tunnels validate both the issuer and the configured DNS origin identity, even when connecting to loopback or a proxy port. Common Name is not a substitute for SAN verification; see [RFC 9525](https://www.rfc-editor.org/rfc/rfc9525.html#section-6).
+
+Use the existing VM certificate lifetime of 8760 hours. Node replacement supplies a fresh key and certificate; this scope adds no renewal scheduler or CA-rotation machinery. Operational node retirement must precede certificate expiry with margin. Node expiry starts replacement rather than guaranteeing termination by a deadline; a prolonged replacement failure can therefore outlive certificate validity and cause TLS failure.
+
+vmconfig validates the matching certificate/key pair and atomically publishes one combined PEM file at `/opt/podplane/secrets/ingress/node.pem`. The directory is root-owned and grants only the SDS runtime group the read/traverse access it needs; neither the file nor its directory is world-readable. A read-only directory mount exposes this dedicated ingress material only to the SDS sidecar, never the whole agent key or receive directory. Updates must not expose mismatched generations or require a data-plane Pod restart.
+
+### SDS source selection
+
+Podplane selects the internal chart value `platform.envoyGateway.ingress.certificates.source`: `node` in tunnel mode, or `secrets` (the default) in NLB mode. This is generated component configuration, not another user-facing cluster exposure selector.
+
+| Location | Bundle path |
+| --- | --- |
+| Node bundle on host | `/opt/podplane/secrets/ingress/node.pem` |
+| Node bundle inside SDS | `/var/run/podplane/ingress-certificates/node.pem` |
+| Domain bundles inside SDS | `/var/run/podplane/ingress-certificates/bundle-<hash>` |
+
+Components mounts both sources at the Operator's default `/var/run/podplane/ingress-certificates` and omits `--certificates-dir`. No Operator code change is required. Podplane matches captured SDS mounts to this contract and removes captured directory overrides when generating cluster-specific seeds.
+
+For `node`, Components mounts the dedicated host directory instead of CSI, renders no ingress `SecretProviderClass`, and points every ingress listener's metadata-only SDS reference at one resource named `node`. The SDS sidecar reads `node.pem`, validates key correspondence, validity, server-authentication usage, chain signatures, and coverage of all configured apex/wildcard names, then serves that same certificate for every ingress listener. It must accept the additional localhost and node/loopback IP SANs and must not apply the NLB pipeline's exact single-domain SAN-set check to this certificate. Missing or invalid initial files prevent TLS serving; invalid later updates retain the last-known-good generation. No ingress serving-certificate or private-key bytes enter Kubernetes Secrets, seed values, etcd, or the Envoy Gateway control plane.
+
+For `secrets`, retain the existing per-domain bundles, exact apex/wildcard validation, and SDS references. One CSI volume mounts all domain bundles into the directory above. Changing the source must not disable Envoy's domain configuration or affect kube-apiserver routing.
+
+In tunnel mode, omit the Podplane operator's entire `ingress_certificates` configuration so neither fallback nor ACME issuance runs; omitting only ACME is insufficient. The operator already skips this manager when its domains map is empty or absent. Seed merging must not restore operator certificate domains from a base seed, defaults, or overlays. Workload and webhook certificate management remain unchanged.
+
+Both cluster node and sleep tunnels mount only the public cluster CA, never the ingress private key. Cluster node tunnels use the existing node trust-delivery path; the `nst` tunnel obtains that same CA from authenticated cluster storage through deployment-generated file references before starting. After wake, the proxy forwards TLS unchanged to the new node's CA-signed certificate. This requires neither the operator to start nor an old node's ingress certificate to survive sleep.
 
 ## Tunnel configuration and files
 
@@ -267,21 +332,31 @@ Provider-specific images and configuration are generated by deployment tooling a
 
 ## Configuration
 
-Cluster configuration selects NLB, tunnel, or custom exposure independently from application domain configuration. It defines stable external API and ingress endpoints while provider-specific settings remain under the selected infrastructure/tunnel provider.
+Podplane cluster configuration has one optional singular `cluster.tunnel` config alongside `cluster.domains` and `cluster.acme`, independent of the infrastructure provider:
 
-Podplane generates one target-group or frontend entry for each exposed API or ingress route and assigns its logical load balancer to the appropriate control-plane or ingress group. Nstance derives proxy listeners from that data. For NLB ingress this may include ports 80 and 443; tunnel ingress uses only 443 because the tunnel provider handles HTTP-to-HTTPS redirection.
+- absent: use provider-default NLB exposure for both Kubernetes API and ingress;
+- present: use tunnels for both Kubernetes API and ingress, generating no NLB resources or registrations.
+
+Podplane has no per-endpoint routing selectors, custom third exposure mode, or mixed API-NLB/ingress-tunnel mode. It defines stable endpoints within the selected mode. Changing NLB/tunnel mode requires infrastructure deletion and redeployment; an in-place switch is unsupported. Preserving Netsy data alone must not be described as a complete state-preserving migration. NAT mode is independent and retains the switching contract in [NAT.md](./NAT.md).
+
+The singular user config does not merge production and wake tunnel processes or credentials. They remain separate internally. Nstance's provider-neutral multi-entry `tunnels` block, logical `load_balancers`, and derived runtime listener contracts above remain unchanged; these are generated/internal contracts, not Podplane per-endpoint selectors.
+
+In NLB mode, Podplane generates one target-group or frontend entry for each exposed API or ingress listener and assigns its logical load balancer to the appropriate control-plane or ingress group. In tunnel mode, it generates tunnel routing entries instead. Nstance derives proxy listeners from that data. NLB ingress uses ports 80 and 443; tunnel ingress uses only 443 because the tunnel provider handles HTTP-to-HTTPS redirection.
 
 Validation requires public/direct external placement for `nst` VMs whenever Podplane Managed NAT is enabled. Cloud Managed NAT defaults `nst` placement to private.
 
-Scale-to-zero requires an exposure method capable of reaching `nstance-server proxy`, unless `wake_at` guarantees recovery. Podplane must not allow an indefinitely sleeping cluster with no wake path.
+Supported Podplane AWS/Google `recommended` deployments generate API and ingress routes capable of reaching `nstance-server proxy` in either mode without a sleep-policy flag. Podplane user config has no `SleepPolicy` and generates no policy/timing overrides; automatic sleep remains disabled by default and manual CLI sleep remains supported. Nstance and Components retain their own policy settings. Generic Nstance deployments require a proxy-reachable exposure method or a guaranteed `wake_at` for recovery; Podplane must not allow an indefinitely sleeping cluster with no wake path.
 
 ## Implementation areas
 
-- **Podplane CLI:** exposure config, validation, generated Terraform, and endpoint outputs.
+- **Podplane CLI:** exposure config, ACME/tunnel exclusion, generated Terraform, node ingress certificate templates, certificate-source and operator seed values, and endpoint outputs.
 - **Nstance Terraform modules:** port-aware AWS target groups and Google Cloud regional external passthrough NLBs, `GCE_VM_IP` NEGs, forwarding-rule metadata, firewall rules, and health checks.
 - **Nstance server:** versioned proxy service, lease-based tunnel desired state, target membership, and ordered transitions; no tunnel workload or provider configuration delivery.
 - **Nstance tunnel supervisor:** root-controlled config and file resolution, outbound Unix gRPC stream, lease enforcement, hardened static-Pod generation, readiness, and restart/backoff.
-- **vmconfig:** VM-lifecycle-owned production `knc` tunnels; installation and hardening of separate `nstance-server proxy` and `nstance-server tunnel` processes; and provider-neutral local routing.
-- **Components/Envoy Gateway:** retain control-plane host exposure on port 443 for tunnels and ports 80/443 for NLBs; no kube-apiserver proxying.
+- **vmconfig:** VM-lifecycle-owned production `knc` tunnels; secure, atomic node-local ingress bundle delivery; installation and hardening of separate `nstance-server proxy` and `nstance-server tunnel` processes; and provider-neutral local routing.
+- **Podplane operator/SDS:** preserve NLB issuance and renewal; extend SDS file loading and SAN validation for one node-local multi-domain certificate. The existing empty-domains configuration disables tunnel-mode issuance.
+- **Components/Envoy Gateway:** select node-local or CSI certificate delivery, share the node-local SDS resource across listeners, and retain control-plane host exposure on port 443 for tunnels and ports 80/443 for NLBs; no kube-apiserver proxying.
 
-Tests must cover shared and separate listener groups, same-tenant shared and cross-tenant rejected load balancers, AWS regional target groups shared across shards and Availability Zones, proxy-port uniqueness, cross-zone enable-before-sleep and disable-after-wake ordering, cluster-leader replacement during each transition, Google Cloud forwarding-rule-address dispatch and equal-port validation, versioned Unix-stream initial/replacement snapshots and reconnect, in-place listener reconciliation, Google Cloud `GCE_VM_IP` NEG metadata resolution and subnet selection, shared same-zone NEG membership, public-HTTPS tunnel kubeconfig and origin verification, one and multiple wake-capable shards, zero-sized group exclusion, partial upstream health, provider-health readiness timeouts and rollback, AWS fail-open without treating an unhealthy target as ready, shard-leader replacement, bounded connection holding, supervisor-initiated reconnect, heartbeat renewal, explicit revocation, bounded ambiguous-disconnect lease expiry, fail-closed stopping, immutable-image and file-mount validation, static-Pod hardening, dedicated processes and shared-agent endpoints, absence of provider fields in the protocol, direct kube-apiserver access, and sleep/wake transitions without empty registration sets.
+Certificate tests must cover multi-domain and wildcard coverage, localhost and both loopback IPs, node IPv4/IPv6 IP SANs including single-stack nodes, missing SANs, wrong issuer/hostname, expired or mismatched initial material, permission isolation, atomic bundle updates, independent node keys, a shared SDS resource across listeners, preservation of the NLB/ACME path, rejection of ACME with tunnels, operator-manager absence after seed merging, and verified API/ingress TLS after sleep replaces every Kubernetes node without the Podplane operator participating in issuance.
+
+Tests must cover shared and separate listener groups, same-tenant shared and cross-tenant rejected load balancers, AWS regional target groups shared across shards and Availability Zones with OpenTofu/Terraform-managed cross-zone routing disabled, proxy-port uniqueness, Google Cloud forwarding-rule-address dispatch and equal-port validation, versioned Unix-stream initial/replacement snapshots and reconnect, in-place listener reconciliation, Google Cloud `GCE_VM_IP` NEG metadata resolution and subnet selection, shared same-zone NEG membership, public-HTTPS tunnel kubeconfig and origin verification, one and multiple wake-capable shards, zero-sized group exclusion, partial upstream health, provider-health readiness timeouts and rollback, AWS fail-open without treating an unhealthy target as ready, shard-leader replacement, bounded connection holding, supervisor-initiated reconnect, heartbeat renewal, explicit revocation, bounded ambiguous-disconnect lease expiry, fail-closed stopping, immutable-image and file-mount validation, static-Pod hardening, dedicated processes and shared-agent endpoints, absence of provider fields in the protocol, direct kube-apiserver access, and sleep/wake transitions without empty registration sets.

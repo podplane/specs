@@ -39,9 +39,16 @@ Nstance adds idempotent operations:
 
 This includes the tenant's configured NAT group in that shard. On wake, normal reconciliation restores desired sizes; NAT dependencies ensure required NAT instances become healthy before nodes launch. `nstance-server proxy` uses configured listener-to-group mappings and needs no previous-size knowledge.
 
-The shard leader reconciles its local record and resumes unfinished work after leadership changes. Nstance does not coordinate tenant sleep state through the cluster leader or contact other shards. On AWS, shard leaders independently enable the shared target groups' cross-zone setting before sleep; the cluster leader coordinates only safely disabling it again as described in [LB.md](./LB.md). This does not change shard-local tenant state ownership.
+During normal or forced sleep, Nstance keeps each NAT instance until its last
+dependent workload is removed, then removes it on the next reconciliation
+without the grace period used for awake tenants. Fixed public IPs stay reserved
+for reuse, as specified in [NAT.md](./NAT.md).
+
+The shard leader reconciles its local record and resumes unfinished work after leadership changes. Nstance-server does not enumerate, contact, coordinate with, or wait for other shards. Sleep, wake, routing cutovers, and instance reconciliation use only the current shard's state and resources. Cross-shard Kubernetes policy belongs to nstance-operator, while administrative cross-shard operations belong to nstance-admin. On AWS, OpenTofu/Terraform keeps cross-zone routing disabled so traffic arriving in a zone reaches only that shard's production or wake-proxy targets, as described in [LB.md](./LB.md).
 
 Local wake-tunnel ownership is deliberately ephemeral rather than part of durable tenant state. The privileged root `nstance-server tunnel` process initiates its local Unix gRPC stream to the unprivileged server process, independently reads the same root-controlled shard configuration, and resolves tunnel secret/storage files itself. The shard leader sends only allowlisted tunnel name, desired running/stopped state, revision, and a renewable lease; it never sends images, commands, mounts, manifests, secrets, or provider details. Heartbeats renew authority while leadership is held. Explicit leadership loss revokes immediately; an ambiguous disconnect retains current state only for the bounded lease while reconnecting, then stops fail-closed. A restarted supervisor removes stale manifests before loading configuration because its leases were lost. The new leader waits for matching revision readiness before continuing destructive reconciliation. Nstance maintains no distributed old/new-leader tunnel handoff or lifecycle state files.
+
+Tunnel ingress uses one node-local certificate/keypair per Envoy-capable node, signed by the existing Nstance cluster CA and covering all configured apex/wildcard domains, localhost, both loopback IPs, and that node's assigned IPv4/IPv6 addresses. The agent provisioning mechanism matches kube-apiserver's; the Podplane operator performs neither ingress fallback nor ACME issuance in tunnel mode. Both production and sleep tunnels trust the public cluster CA and verify the configured origin hostname. After wake, the proxy forwards TLS unchanged to a newly provisioned node's certificate, so recovery needs neither an old node's private key nor operator ingress issuance. NLB deployments retain operator-owned fallback/ACME bundles. See [LB.md](./LB.md#ingress-certificates-and-sds) for certificate delivery, lifetime, and SDS requirements.
 
 ## Supported topologies
 
@@ -55,7 +62,9 @@ Nstance supports both scenarios; the initial nstance-operator automatic policy p
 
 ## Automatic sleep
 
-nstance-operator owns generic Kubernetes automatic-sleep policy. Podplane enables and configures it rather than implementing Kubernetes eligibility itself. The feature is disabled by default; initial defaults are one remaining node, 30 minutes of inactivity, a ten-minute CronJob look-ahead, and a two-minute wake lead. Activity windows remain independently configurable per listener.
+nstance-operator owns generic Kubernetes automatic-sleep policy. Podplane user config has no `SleepPolicy` and Podplane generates no policy or timing overrides; Nstance/operator defaults own those settings. Automatic sleep is disabled by default; initial defaults are one remaining node, 30 minutes of inactivity, a ten-minute CronJob look-ahead, and a two-minute wake lead. Nstance and Components retain their own policy configurability, including independently configurable activity windows per listener.
+
+Supported Podplane AWS/Google clusters using the `recommended` seed generate wake-capable routing and proxy services without a sleep-policy flag, even while automatic sleep is disabled. Manual CLI sleep remains supported. Exposure uses provider-default NLBs for both API and ingress when the singular optional `cluster.tunnel` config is absent, or tunnels for both with no NLB resources or registrations when present, as defined in [LB.md](./LB.md). Changing that mode requires infrastructure deletion/redeployment, not an in-place switch; retaining Netsy data alone is not a complete state-preserving migration. NAT mode remains independent under [NAT.md](./NAT.md).
 
 When enabled, nstance-operator initiates automatic sleep only when all of these hold:
 
@@ -65,9 +74,9 @@ When enabled, nstance-operator initiates automatic sleep only when all of these 
 4. no CronJob with `.spec.suspend=false` is due within the configurable look-ahead window;
 5. external ingress and kube-apiserver traffic have both been inactive for their independently configurable windows.
 
-Exactly one node is the initial default, not an Nstance limitation. nstance-operator calls `SleepTenant` for every shard, processing the shard hosting its coordinating Kubernetes node last. Each Nstance-server performs the final local traffic check before committing sleep, closing the race between observation and VM removal. Sleep uses orderly workload termination; forced sleep may still interrupt workloads because the final node has nowhere to drain to.
+Exactly one node is the initial default, not an Nstance limitation. On a self-managed cluster, nstance-operator runs on a control-plane node and calls `SleepTenant` for every shard with that node's shard last. Any in-cluster etcd, Netsy, or other datastore quorum required by the Kubernetes API is wholly contained in that final shard; alternatively, it remains external to the sleeping cluster. This topology keeps the API available while earlier shards sleep. Before the final call, the operator persists a `finalizing` transaction checkpoint containing the final shard and every shard that has already accepted sleep. No successful final-shard call requires a later Kubernetes write. Each Nstance-server performs the final local traffic check before committing sleep, closing the race between observation and VM removal. Sleep uses orderly workload termination; forced sleep may still interrupt workloads because the final node has nowhere to drain to.
 
-The all-shard operation is compensating rather than atomic. If any shard rejects or fails after another shard has durably committed sleep, nstance-operator durably calls `WakeTenant` for every shard that already accepted the request. It retains the sleep-request annotation and retries compensation until every affected shard's sleep entry has been removed; only then does it emit the rejection Event and remove the annotation. An operator restart resumes the same compensation from the annotation and observed shard state. This prevents a failed sleep request from leaving part of the cluster indefinitely asleep.
+The all-shard operation is compensating rather than atomic. The sleep-request and progress annotations remain present while the cluster is asleep. After Kubernetes returns, nstance-operator reads every shard's authoritative status; if any shard is awake, it durably calls `WakeTenant` for all shards and removes the annotations only after every shard is awake. If any shard rejects or fails before the final checkpoint, nstance-operator similarly wakes every shard whose sleep may have succeeded and retries compensation until their sleep entries have been removed; only then does it emit the rejection Event and remove the annotations. An operator restart resumes forward progress, finalization, or compensation from the annotations and observed shard state. This prevents control-plane shutdown or a failed request from leaving the cluster indefinitely partially asleep.
 
 ## eBPF port activity monitoring
 
@@ -115,7 +124,7 @@ If link validation or a configured map read fails, the report includes `metrics.
 
 Periodic agent reports provide the initial inactivity signal. For the final guard, `SleepTenant(if_not_busy=true)` establishes the proxy path and starts the provider-specific production-target withdrawal described in [LB.md](./LB.md). Once the provider confirms that production targets are draining and receive no new connections, Nstance waits for a subsequent normal health report from each remaining relevant agent.
 
-Nstance refuses sleep if a required report is missing, contains `metrics.ebpf_error`, reports a nonzero active count, or if proxy payload arrives during the transition. On refusal, Nstance restores production routing before withdrawing the proxy path. Otherwise it waits for production targets to finish deregistering, commits the tenant's sleep entry, and begins instance termination. Forced sleep bypasses this guard. Reports never include client addresses or connection tuples.
+Nstance refuses sleep if a required report is missing, contains `metrics.ebpf_error`, reports a nonzero active count, or if proxy payload arrives during the transition. On refusal, Nstance restores production routing before withdrawing the proxy path. Otherwise it waits for production targets to finish deregistering, commits the tenant's sleep entry, and begins instance termination. Forced sleep bypasses the activity guard and remaining drain period, but still requires a healthy wake path and provider confirmation that production targets no longer receive new connections. Instances may terminate while old connections are still draining. Reports never include client addresses or connection tuples.
 
 ## CronJob wake deadlines
 
@@ -145,7 +154,9 @@ The local `nstance-server proxy` uses one root-owned, proxy-accessible Unix gRPC
 
 ## Operator registration bootstrap
 
-Podplane supports scale-to-zero only for AWS and Google Cloud clusters using the `recommended` seed. nstance-operator requires Nstance CRDs, Cluster API core and CRDs, and cert-manager and its CRDs; this dependency graph is not added to `minimal` or `none`.
+Podplane supports scale-to-zero only for AWS and Google Cloud clusters using the `recommended` seed. nstance-operator requires Nstance CRDs, Cluster API core and CRDs, and the Pod Certificate stack described in [CERTS.md](./CERTS.md#platform-serving-certificates-and-ca-injection). CAPI and Nstance project webhook Service certificates signed by `podplane-operator`, which also injects the workload CA into their webhook configurations. Its CA key is mounted through Secrets Store CSI and the selected provider; cert-manager is not used. The Nstance/CAPI provider overlay is not added to `minimal` or `none`.
+
+Webhook TLS is separate from operator registration with Nstance: the workload CA does not replace Nstance's public CA or registration nonce, and Nstance registration does not use the Podplane Secrets API or CSI.
 
 For supported clusters, Terraform conditionally creates or adopts Nstance's registration signing key, then the cluster-specific Netsy seed creation operation reads that key in memory, mints a tenant- and cluster-scoped single-use nonce with a 30-minute TTL, and inserts the nonce as a dedicated Kubernetes Secret. It reads the signing key only when creating the seed; refresh and completed-seed adoption use non-secret metadata. The public CA is seeded separately as a ConfigMap. Neither the signing key nor nonce appears in generic seeds, Terraform schema values/state/output, logs, diagnostics, command arguments, or temporary files.
 
@@ -160,7 +171,20 @@ podplane cluster sleep
 podplane cluster sleep --force
 ```
 
-The command uses `SelfSubjectAccessReview` to verify that the user may patch the CAPI `Cluster`, then writes `nstance.dev/sleep-request=<timestamp>` or `force:<timestamp>` and disconnects immediately. nstance-operator calls `SleepTenant` for every shard and removes the annotation after all requests are durable. On rejection after a partial commit, it first completes the durable all-shard compensation described above, then emits a Kubernetes Event and removes the annotation. If the operator restarts first, the remaining annotation causes a safe retry or resumes compensation. Initially this is limited to `podplane:admins`, which are bound to `cluster-admin`; nstance-operator requires CAPI Cluster get/list/watch/patch/update permissions.
+The command uses `SelfSubjectAccessReview` to verify that the user may patch the
+CAPI `Cluster`, then writes `nstance.dev/sleep-request=<timestamp>` or
+`force:<timestamp>` and disconnects immediately. nstance-operator calls
+`SleepTenant` for every shard, persisting the finalizing checkpoint before the
+last call. The request and progress annotations remain throughout sleep; no
+Kubernetes write is required after the final shard accepts sleep. After wake,
+the operator removes them only when every shard is awake. On rejection after a
+partial commit, it completes durable all-shard compensation before emitting the
+rejection Event and removing the annotations. An operator restart resumes the
+transaction from those annotations and authoritative shard status.
+
+Initially this is limited to `podplane:admins`, which are bound to
+`cluster-admin`; nstance-operator requires CAPI Cluster
+get/list/watch/patch/update permissions.
 
 Normal sleep applies the automatic-sleep guards. `--force` bypasses node-count, pending-scale, Job, CronJob, and traffic checks after explicit confirmation, but still requests orderly shutdown and warns that active workloads and connections can be interrupted. There is no wake command: any kubectl, Helm, kube-apiserver, or ingress request reaches `nstance-server proxy` and wakes a shard.
 
@@ -171,7 +195,7 @@ Normal sleep applies the automatic-sleep guards. `--force` bypasses node-count, 
 - **Nstance tunnel supervisor:** privileged root config/file resolution, supervisor-initiated control stream, renewable-lease enforcement, hardened kubelet static-Pod generation, and readiness/restart handling.
 - **Nstance agent:** read-only pinned-map collection and eBPF counter/error reporting.
 - **vmconfig:** dormant-by-default `knc`/`knd` eBPF connection counters, bpftool oneshot loader, pin permissions, VM-lifecycle-owned production `knc` tunnels, `nst` kind, and installation/hardening of separate optional `nstance-server proxy` and `nstance-server tunnel` processes.
-- **Podplane CLI:** generated sleep policy and the annotation-based sleep command.
+- **Podplane CLI:** wake-capable routing for supported recommended deployments and the annotation-based manual sleep command; no user `SleepPolicy` or generated policy/timing overrides.
 - **Components:** deploy/configure nstance-operator and the required operator permissions.
 
 Tests must cover one-node and redundant two-zone sleep, all-shard sleep ordering, durable compensation when a later shard rejects or fails, operator restart during compensation, local wake, simultaneous wakes in different shards, zero-sized shard exclusion, listener-derived port sets including NLB ingress port 80, zero, nonzero, absent, failed, and stale eBPF reports, traffic during production-target draining, pinned-link loss, active/terminating Jobs, CronJob time zones/deadlines, simultaneous network/timer wakeups, shard-leader failover, Unix stream reconnect and snapshot replacement, in-place listener reconciliation, supervisor-initiated reconnect, heartbeat renewal, immediate explicit revocation, bounded ambiguous-disconnect behavior, fail-closed lease expiry, hardened static Pods, dedicated and shared-agent tunnel layouts, absence of provider details in Nstance messages, absence of lifecycle state files, forced sleep, NAT dependencies, signing-key/seed create-or-adopt after interrupted applies, signing-key reads only during seed creation, lost registration responses, and bootstrap Secret deletion after durable certificate storage.

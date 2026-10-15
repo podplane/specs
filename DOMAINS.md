@@ -163,9 +163,11 @@ Domainless clusters use the existing internal registry hostname `<cluster-id>-re
 
 ## TLS
 
-The Kubernetes API uses its Podplane cluster CA, which the CLI places in kubeconfig.
+The Kubernetes API uses its Podplane cluster CA. In NLB mode, the CLI places that CA in kubeconfig; tunnel clients instead verify the provider's public edge certificate.
 
-The Podplane operator always publishes a self-signed apex-and-wildcard fallback certificate. Domains using a supported ACME DNS provider can replace that fallback with a publicly trusted certificate; manual domains and unsupported DNS providers retain the fallback. See [ACME.md](./ACME.md) for configuration, credentials, issuance, delivery, and renewal behavior.
+Without tunnels, the Podplane operator publishes a self-signed apex-and-wildcard fallback certificate per domain. Domains using a supported ACME DNS provider can replace that fallback with a publicly trusted certificate; manual domains and unsupported DNS providers retain the fallback. See [ACME.md](./ACME.md) for configuration, credentials, issuance, delivery, and renewal behavior.
+
+Tunnel exposure rejects `cluster.acme` and disables operator ingress issuance. Each Envoy-capable node instead uses one dedicated agent-generated key and Nstance-cluster-CA-signed certificate covering all configured apex/wildcard domains, delivered locally through SDS. Tunnel clients trust the provider's public edge certificate; production and sleep tunnel processes verify the internal API/ingress certificates against the cluster CA and the expected DNS hostname. See [LB.md](./LB.md#ingress-certificates-and-sds).
 
 ## Cluster-create wizard
 
@@ -229,10 +231,10 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kuber
 
 ### 6. Wire seeded ingress configuration
 
-- Pass all configured domains to Envoy Gateway and the Podplane operator, with the first marked as the default.
+- Pass all configured domains to Envoy Gateway, with the first marked as the default. Populate Podplane operator ingress certificate domains only without tunnels; tunnel mode selects node-local SDS delivery and must keep the operator's ingress manager disabled after seed merging.
 - Ensure no ingress or ingress-certificate components are enabled solely because a domain is absent.
 - Keep registry ingress disabled unless explicitly enabled; when enabled, route `registry.<default-domain>` through the default domain's selected load balancer.
-- Keep operator-owned ACME DNS-01 automation and external SDS delivery aligned with [ACME.md](./ACME.md).
+- Keep operator-owned ACME DNS-01 automation and external SDS delivery aligned with [ACME.md](./ACME.md), and node-local tunnel ingress aligned with [LB.md](./LB.md#ingress-certificates-and-sds).
 
 ### 7. Verify end-to-end behavior
 

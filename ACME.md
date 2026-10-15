@@ -9,11 +9,13 @@
 > exclusion from etcd, xDS, control-plane memory, logs, events, and status in an
 > integrated cluster.
 
-Related: [CERTS.md](./CERTS.md), [DOMAINS.md](./DOMAINS.md)
+Related: [CERTS.md](./CERTS.md), [DOMAINS.md](./DOMAINS.md), [LB.md](./LB.md#ingress-certificates-and-sds)
 
 ## Goal
 
-Podplane provides an apex-and-wildcard serving certificate for every configured cluster domain without persisting private keys in Kubernetes Secrets or etcd. The Podplane operator always provides an immediately usable self-signed fallback and, when `cluster.acme` is configured, replaces it with an ACME DNS-01 certificate for supported DNS providers.
+For deployments without `cluster.tunnel`, Podplane provides an apex-and-wildcard serving certificate for every configured cluster domain without persisting private keys in Kubernetes Secrets or etcd. The Podplane operator provides an immediately usable self-signed fallback and, when `cluster.acme` is configured, replaces it with an ACME DNS-01 certificate for supported DNS providers.
+
+The operator-owned issuance, external storage, and per-domain SDS contract below does not apply to tunnel exposure. `cluster.tunnel` and `cluster.acme` are mutually exclusive. Tunnel mode disables the operator's entire ingress certificate manager and instead uses one agent-generated, Nstance-CA-signed multi-domain certificate/keypair per Envoy-capable node, delivered locally through SDS as specified in [LB.md](./LB.md#ingress-certificates-and-sds). The independent workload/webhook certificate stack is unchanged.
 
 Initial public issuance supports AWS Route53 through Lego. Google Cloud DNS, Azure DNS, Cloudflare, and additional Lego providers are future increments behind an explicit Podplane provider allowlist.
 
@@ -53,7 +55,7 @@ The server defaults to the Let's Encrypt production directory. ACME configuratio
 
 `provider.hosted_zone_id` is optional in user configuration. Generated OpenTofu/Terraform resolves omitted Route53 zone IDs and passes the result and generated role ARN through the seed's provider-neutral `values_content`; generated values do not mutate or persist into the cluster config.
 
-When `cluster.acme` is absent, all domains retain self-signed fallback certificates. When it is present, only supported domains attempt ACME; manual and unsupported domains retain their fallbacks.
+Without tunnels, when `cluster.acme` is absent, all domains retain self-signed fallback certificates. When it is present, only supported domains attempt ACME; manual and unsupported domains retain their fallbacks.
 
 ## Certificate contract
 

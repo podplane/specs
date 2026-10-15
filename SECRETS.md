@@ -593,7 +593,7 @@ service:
   name: platform-podplane-operator
 ```
 
-TLS serving certificates should be managed by cert-manager resources in the `platform-podplane` chart. The chart should create a `Certificate`, mount the resulting serving cert into the operator pod, and use cert-manager CA injection for the `APIService` `caBundle`. The operator should not implement custom self-signed certificate bootstrap in v1. Podplane Secrets is part of the platform/recommended components path and is not required for the minimal seed.
+TLS serving certificates follow [CERTS.md](./CERTS.md#platform-serving-certificates-and-ca-injection). The combined `podplane-operator` issues and rotates its aggregated API Service certificate directly from its CSI-mounted workload CA key, writing the keypair into a runtime volume. It cannot project a Pod Certificate signed by itself because initial issuance would block its own startup. The chart annotates the `APIService` with `certificates.podplane.dev/inject-ca-from: workload`, and the operator injects the workload CA bundle into `caBundle`. No cert-manager resources or Kubernetes TLS Secrets are used. Podplane Secrets is part of the platform/recommended components path and is not required for the minimal seed.
 
 The `platform-podplane-operator` Deployment must run exactly `1` replica by default and should not expose a normal autoscaling path. This is acceptable for Podplane Secrets traffic: secret writes are human/automation control-plane operations, and `SecretProviderBinding` reconciliation should be lightweight. A single correctly vertically scaled operator is simpler and safer than horizontally scaling the aggregated API while it uses an in-memory encryption key for client-side encrypting create/update request values.
 
@@ -610,7 +610,7 @@ rbac:
   aggregateDefaultRoles: true
 ```
 
-When `rbac.create` is true, the chart should create the operator RBAC and helper ClusterRoles. When `rbac.aggregateDefaultRoles` is also true, the relevant helper ClusterRoles should carry Kubernetes aggregation labels. Following the cert-manager pattern, helper ClusterRoles can also augment built-in default roles when their rules exactly match the desired default-role behavior:
+When `rbac.create` is true, the chart should create the operator RBAC and helper ClusterRoles. When `rbac.aggregateDefaultRoles` is also true, the relevant helper ClusterRoles should carry Kubernetes aggregation labels. Helper ClusterRoles can augment built-in default roles when their rules exactly match the desired default-role behavior:
 
 - `podplane-secrets-admin`: full named `secretproviderkeyspaces` management plus `publickeys` get; label with `aggregate-to-admin: "true"`.
 - `podplane-secrets-view`: metadata-only named `secretproviderkeyspaces` get plus `publickeys` get; label with `aggregate-to-edit: "true"`.
@@ -1422,7 +1422,7 @@ This repository owns the platform component chart and component metadata needed 
 - Configure the chart to run the operator with exactly `replicas: 1` by default and do not expose autoscaling as a normal v1 path.
 - Register `v1beta1.secrets-api.podplane.dev` via `APIService`.
 - Ensure APIService availability is gated on serving certificate validity, delegated auth readiness, discovery readiness, and handler readiness; upgrade/uninstall must not leave a stale unavailable APIService behind.
-- Add cert-manager `Certificate` and CA injection wiring for the APIService in the chart.
+- Mount the workload CA key through the bootstrap Secrets Store CSI class, provide the operator's serving-certificate runtime volume, and annotate the APIService for workload-CA injection as defined in [CERTS.md](./CERTS.md#platform-serving-certificates-and-ca-injection). Do not render cert-manager resources or TLS Secrets.
 - Add chart RBAC defaults, helper ClusterRoles, and aggregation labels matching the spec; aggregate only `publickeys/latest` read access to `view`, and do not create broad user bindings or a default `aggregate-to-view` role for `secretproviderkeyspaces`.
 - Add native RBAC manifests for admin and developer roles, including custom verbs `overwrite`, `restore`, and `destroy`, while relying on the operator to enforce those custom verbs with SAR checks.
 
@@ -1510,7 +1510,7 @@ Run repository-local checks after implementation in each repo, then run cross-re
 
 #### `github.com/podplane/components`
 
-- Validate chart rendering for the singleton `platform-podplane-operator` Deployment, Service, APIService, cert-manager `Certificate`, CA injection annotations, `SecretProviderBinding` CRD, RBAC helper roles, aggregation labels, CEL pod policy, and component metadata.
+- Validate chart rendering for the singleton `platform-podplane-operator` Deployment, Service, APIService, bootstrap workload-CA CSI mount, serving-certificate runtime volume, workload-CA injection annotation, `SecretProviderBinding` CRD, RBAC helper roles, aggregation labels, CEL pod policy, and component metadata. Assert absence of cert-manager resources and TLS Secrets.
 - Verify no chart default creates broad user bindings or an `aggregate-to-view` secrets role.
 
 #### `github.com/podplane/templates`
