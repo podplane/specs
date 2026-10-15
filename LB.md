@@ -282,9 +282,9 @@ Use the existing VM certificate lifetime of 8760 hours. Node replacement supplie
 
 vmconfig validates the matching certificate/key pair and atomically publishes one combined PEM file at `/opt/podplane/secrets/ingress/node.pem`. The directory is root-owned and grants only the SDS runtime group the read/traverse access it needs; neither the file nor its directory is world-readable. A read-only directory mount exposes this dedicated ingress material only to the SDS sidecar, never the whole agent key or receive directory. Updates must not expose mismatched generations or require a data-plane Pod restart.
 
-### SDS source selection
+### SDS provider selection
 
-Podplane selects the internal chart value `platform.envoyGateway.ingress.certificates.source`: `node` in tunnel mode, or `secrets` (the default) in NLB mode. This is generated component configuration, not another user-facing cluster exposure selector.
+Podplane sets the internal chart value `platform.envoyGateway.ingress.certificates.provider` to `node` in tunnel mode, or the selected CSI provider (`aws`, `gcp`, `vault`, or `openbao`) in NLB mode. The chart has no default provider. This is generated component configuration, not another user-facing cluster exposure selector.
 
 | Location | Bundle path |
 | --- | --- |
@@ -296,7 +296,7 @@ Components mounts both sources at the Operator's default `/var/run/podplane/ingr
 
 For `node`, Components mounts the dedicated host directory instead of CSI, renders no ingress `SecretProviderClass`, and points every ingress listener's metadata-only SDS reference at one resource named `node`. The SDS sidecar reads `node.pem`, validates key correspondence, validity, server-authentication usage, chain signatures, and coverage of all configured apex/wildcard names, then serves that same certificate for every ingress listener. It must accept the additional localhost and node/loopback IP SANs and must not apply the NLB pipeline's exact single-domain SAN-set check to this certificate. Missing or invalid initial files prevent TLS serving; invalid later updates retain the last-known-good generation. No ingress serving-certificate or private-key bytes enter Kubernetes Secrets, seed values, etcd, or the Envoy Gateway control plane.
 
-For `secrets`, retain the existing per-domain bundles, exact apex/wildcard validation, and SDS references. One CSI volume mounts all domain bundles into the directory above. Changing the source must not disable Envoy's domain configuration or affect kube-apiserver routing.
+For CSI providers, retain the existing per-domain bundles, exact apex/wildcard validation, and SDS references. One CSI volume mounts all domain bundles into the directory above. Changing the provider must not disable Envoy's domain configuration or affect kube-apiserver routing.
 
 In tunnel mode, omit the Podplane operator's entire `ingress_certificates` configuration so neither fallback nor ACME issuance runs; omitting only ACME is insufficient. The operator already skips this manager when its domains map is empty or absent. Seed merging must not restore operator certificate domains from a base seed, defaults, or overlays. Workload and webhook certificate management remain unchanged.
 
