@@ -1,8 +1,6 @@
 # Podplane RBAC
 
-> **STATUS**: In progress
->
-> Remaining: Podplane RBAC docs and regenerated seeds.
+> **STATUS**: Implemented
 
 ## Goal
 
