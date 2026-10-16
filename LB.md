@@ -193,7 +193,9 @@ The design must account for provider fail-open behaviour and must never intentio
 
 ## Nstance Server VM
 
-The vmconfig `nst` kind replaces Nstance's generic server userdata. It installs nstance-server, Fluent Bit, optional separate `nstance-server proxy` and privileged `nstance-server tunnel` services, and the standard vmconfig configuration/watch machinery. Its containerd and Podplane Registry configuration matches `knd`, so tunnel static Pods can use the same S3-backed image distribution. Its standalone kubelet watches the standard `/etc/kubernetes/manifests` directory rather than a tunnel-specific path. Provider-specific tunnel software and generated configuration live in immutable container images and deployment configuration, not in Nstance or vmconfig code.
+The vmconfig `nst` kind replaces Nstance's generic server userdata. It installs nstance-server, Fluent Bit, optional separate `nstance-server proxy` and privileged `nstance-server tunnel` services, and the standard vmconfig configuration machinery. Its containerd and Podplane Registry configuration matches `knd`, so tunnel static Pods can use the same S3/GCS-backed image distribution. Its standalone kubelet watches the standard `/etc/kubernetes/manifests` directory rather than a tunnel-specific path. Provider-specific tunnel software and generated configuration live in immutable container images and deployment configuration, not in Nstance or vmconfig code.
+
+`nst` has no nstance-agent runtime updates. Its `mutable.env` is populated once through user-data and treated as immutable; configuration changes replace the VM through its managed group. Non-secret SSH, telemetry, and registry settings share the same generated values as `knc`/`knd`, but static access keys are not copied into `nst` user-data; `nst` uses VM-role credentials. vmconfig derives its server ID from detected provider instance identity and leaves the provider-assigned hostname unchanged.
 
 Nstance Server VMs use private service subnets by default. Podplane Managed NAT always gives them internet access independent of the NAT group, which sleeps with the tenant:
 
@@ -217,7 +219,7 @@ No separate ingress-node role or live upstream discovery is required. Components
 
 Tunnel providers handle public HTTP-to-HTTPS redirects at their edge and do not forward port 80 to Envoy. The initial Cloudflare implementation uses a hostname-scoped redirect rule; a future ngrok implementation can use its redirect Traffic Policy. Providers without an edge redirect may expose HTTPS only rather than adding a port-80 tunnel upstream.
 
-Each `knc` control-plane VM's production control-plane tunnel is owned by the VM lifecycle and remains entirely outside Nstance control. While a shard is asleep, a wake-capable shard leader advertises a separate wake tunnel targeting its local `nstance-server proxy`. Reconciliation toward asleep waits for that local wake path before terminating control-plane VMs. Reconciliation toward awake restores the VMs, waits for ordinary fresh agent health and the requested upstream TCP port, then withdraws the wake path. The external tunnel endpoint remains stable.
+Each `knc` control-plane VM's node tunnel is owned by the VM lifecycle and remains entirely outside Nstance control. While a shard is asleep, a wake-capable shard leader advertises a separate tunnel targeting its local `nstance-server proxy`. Reconciliation toward asleep waits for that local wake path before terminating control-plane VMs. Reconciliation toward awake restores the VMs, waits for ordinary fresh agent health and the requested upstream TCP port, then withdraws the wake path. The external tunnel endpoint remains stable.
 
 A separate `nstance-server tunnel` process is the privileged root supervisor for local `nst` wake tunnels. It independently reads the same root-controlled shard configuration as the unprivileged server process and resolves all referenced secret and storage files itself. It initiates the local Unix gRPC stream to the server process, which never sends images, commands, mounts, manifests, secrets, credentials, storage contents, or provider details.
 
@@ -225,13 +227,13 @@ Server messages contain only an allowlisted tunnel name, desired `running` or `s
 
 The shard leader renews each desired-state lease with heartbeats. Explicit leadership loss immediately sends or causes revocation. An ambiguous disconnect leaves the current state in place through a bounded lease while `nstance-server tunnel` reconnects; if it cannot renew before expiry, the supervisor stops the tunnel fail-closed. On restart, the supervisor removes stale manifests before loading configuration because its in-memory leases have been lost. A new leader requests its local wake endpoint and waits for matching revision readiness before any destructive transition. No distributed handoff or lifecycle state files are used.
 
-The model permits either a dedicated static Pod per tunnel or multiple logical endpoints managed by one shared local agent while any endpoint is active. The initial Cloudflare deployment uses dedicated tunnel processes and credentials. An ngrok deployment may use one agent with independently controlled endpoints. The configuration expresses these generic lifecycle modes, while the protocol exposes neither the mode nor provider-specific fields.
+The model permits either a dedicated static Pod per tunnel or multiple logical endpoints managed by one shared local agent while any endpoint is active. The initial Cloudflare deployment uses dedicated processes sharing the existing tunnel's credential. A future ngrok deployment may use one agent with independently controlled endpoints; Podplane does not currently support ngrok. The configuration expresses these generic lifecycle modes, while the protocol exposes neither the mode nor provider-specific fields.
 
-Cloudflare tunnel processes using one credential provide availability but no traffic steering. Therefore production and wake tunnel processes may overlap only during transitions, when both paths can serve requests; the wake tunnel process must be withdrawn while the tenant is awake so normal traffic bypasses `nstance-server proxy`.
+Cloudflare tunnel processes using one credential provide availability but no traffic steering. Therefore node and `nst` tunnel processes may overlap only during transitions, when both paths can serve requests; the `nst` tunnel process must be withdrawn while the tenant is awake so normal traffic bypasses `nstance-server proxy`.
 
 The initial Cloudflare implementation uses public HTTPS applications, not Cloudflare's arbitrary-TCP client mode. Clients connect to Cloudflare's HTTPS edge on port 443 without `cloudflared`; Cloudflare terminates client TLS and sends HTTPS through the tunnel to kube-apiserver on local port 6443 or Envoy on local port 443. The `nst` wake tunnel process sends the same HTTPS origin traffic to local `nstance-server proxy`, which transparently forwards it to the selected production port after wake. Locally managed ingress rules allow the control-plane and `nst` tunnel processes to use these different local targets.
 
-Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and content. In tunnel mode, Podplane generates the kubeconfig API URL on external port 443 and relies on the operating system's public CA roots for the Cloudflare edge certificate instead of embedding the kube-apiserver CA. Cloudflare-to-origin connections remain TLS-protected. Generated deployment configuration gives both production and `nst` tunnel containers the existing Nstance cluster CA for API and ingress verification, with the API hostname or the matching ingress hostname as the expected origin identity. TLS verification must not be disabled.
+Cloudflare is therefore a trust boundary for Kubernetes API bearer tokens and content. In tunnel mode, Podplane generates the kubeconfig API URL on external port 443 and relies on the operating system's public CA roots for the Cloudflare edge certificate instead of embedding the kube-apiserver CA. Cloudflare-to-origin connections remain TLS-protected. Generated deployment configuration gives both node and `nst` tunnel containers the existing Nstance cluster CA for API and ingress verification, with the API hostname or the matching ingress hostname as the expected origin identity. TLS verification must not be disabled.
 
 ## Ingress certificates and SDS
 
@@ -244,7 +246,7 @@ Certificate ownership follows the exposure mode:
 | NLB | Absent | Operator-managed self-signed per-domain bundles through CSI and SDS |
 | NLB | Present | Operator-managed self-signed fallback and ACME per-domain bundles through CSI and SDS |
 
-NLB certificate issuance, storage, and renewal retain [ACME.md](./ACME.md)'s contract. Tunnel mode instead uses the same node certificate provisioning mechanism as kube-apiserver: nstance-agent generates the private key locally, submits its public key, and receives a certificate signed by nstance-server using the existing cluster CA. No additional CA, cluster-leader certificate manager, signing API, or ingress private-key publication to the secrets backend is required.
+NLB certificate issuance, storage, and renewal retain [ACME.md](./ACME.md)'s contract. Tunnel mode instead uses the same node certificate provisioning mechanism as kube-apiserver: nstance-agent generates the private key locally, submits its public key, and receives a certificate signed by nstance-server using the existing cluster CA. No additional CA, cluster-leader certificate manager, signing API, or ingress private-key publication to the secrets backend is required. Local clusters also use node-local delivery, signed by the local fake Nstance server's CA, without enabling tunnels.
 
 ### Node-local tunnel ingress certificate
 
@@ -292,7 +294,9 @@ Podplane sets the internal chart value `platform.envoyGateway.ingress.certificat
 | Node bundle inside SDS | `/var/run/podplane/ingress-certificates/node.pem` |
 | Domain bundles inside SDS | `/var/run/podplane/ingress-certificates/bundle-<hash>` |
 
-Components mounts both sources at the Operator's default `/var/run/podplane/ingress-certificates` and omits `--certificates-dir`. No Operator code change is required. Podplane matches captured SDS mounts to this contract and removes captured directory overrides when generating cluster-specific seeds.
+Components mounts both sources at the Operator's default `/var/run/podplane/ingress-certificates` and omits `--certificates-dir`. No Operator directory change is required. Podplane matches captured SDS mounts to this contract and removes captured directory overrides when generating cluster-specific seeds.
+
+SDS takes one `--node-certificate=<comma-separated-apex-domains>` for the shared `node` resource, or repeatable `--domain-certificate=<resource>=<apex-domain>` flags for per-domain bundles. The flags are mutually exclusive; `node` is reserved and cannot name a domain resource.
 
 For `node`, Components mounts the dedicated host directory instead of CSI, renders no ingress `SecretProviderClass`, and points every ingress listener's metadata-only SDS reference at one resource named `node`. The SDS sidecar reads `node.pem`, validates key correspondence, validity, server-authentication usage, chain signatures, and coverage of all configured apex/wildcard names, then serves that same certificate for every ingress listener. It must accept the additional localhost and node/loopback IP SANs and must not apply the NLB pipeline's exact single-domain SAN-set check to this certificate. Missing or invalid initial files prevent TLS serving; invalid later updates retain the last-known-good generation. No ingress serving-certificate or private-key bytes enter Kubernetes Secrets, seed values, etcd, or the Envoy Gateway control plane.
 
@@ -300,20 +304,21 @@ For CSI providers, retain the existing per-domain bundles, exact apex/wildcard v
 
 In tunnel mode, omit the Podplane operator's entire `ingress_certificates` configuration so neither fallback nor ACME issuance runs; omitting only ACME is insufficient. The operator already skips this manager when its domains map is empty or absent. Seed merging must not restore operator certificate domains from a base seed, defaults, or overlays. Workload and webhook certificate management remain unchanged.
 
-Both cluster node and sleep tunnels mount only the public cluster CA, never the ingress private key. Cluster node tunnels use the existing node trust-delivery path; the `nst` tunnel obtains that same CA from authenticated cluster storage through deployment-generated file references before starting. After wake, the proxy forwards TLS unchanged to the new node's CA-signed certificate. This requires neither the operator to start nor an old node's ingress certificate to survive sleep.
+Both node and `nst` tunnels mount only the public cluster CA, never the ingress private key. Node tunnels use the existing node trust-delivery path; generated Terraform copies the public `cluster/ca.crt` into each shard's `tunnel-ca.crt`, which the `nst` tunnel loads through its shard-scoped storage reference before starting. After wake, the proxy forwards TLS unchanged to the new node's CA-signed certificate. This requires neither the operator to start nor an old node's ingress certificate to survive sleep; it does not add automatic CA refresh or rotation.
 
 ## Tunnel configuration and files
 
-The root-controlled shard configuration has a dedicated provider-neutral `tunnels` block. Each allowlisted entry selects an immutable container image and mounts secret or storage sources as files:
+The root-controlled shard configuration has a dedicated provider-neutral `tunnels` block. Each allowlisted entry selects an immutable container image and mounts generated configuration or secret/storage references as files:
 
 ```jsonc
 "tunnels": {
   "control-plane-wake": {
     "image": "registry.example/tunnel@sha256:0123456789abcdef...",
+    "readiness_url": "http://127.0.0.1:2000/ready",
     "files": {
       "/run/tunnel/credential": {
         "kind": "secret",
-        "source": "control-plane-tunnel-credential"
+        "source": "tunnel-credentials"
       },
       "/etc/tunnel/config.json": {
         "kind": "storage",
@@ -324,11 +329,13 @@ The root-controlled shard configuration has a dedicated provider-neutral `tunnel
 }
 ```
 
-The image reference must be immutable. File destinations are container mount paths; configuration validation rejects writable image tags, duplicate destinations, unsafe paths, unsupported file kinds, and tunnel names not referenced consistently by wake routing. The privileged `nstance-server tunnel` process, not the unprivileged server process, resolves these sources and materializes root-only host files before generating the static Pod. The same sources may independently appear in production VM deployment configuration.
+The image reference must be immutable. File destinations are container mount paths; configuration validation rejects writable image tags, duplicate destinations, unsafe paths, unsupported file kinds, and tunnel names not referenced consistently by wake routing. Files may also use `env`, `json`, or `string` with inline `template` content for non-secret configuration; a separate stored configuration object is not required. The privileged `nstance-server tunnel` process, not the unprivileged server process, resolves these sources and materializes root-only host files before generating the static Pod. Node tunnel deployment configuration references the same credential secret.
+
+The AWS and Google Terraform shard modules accept one `tunnels` map combining runtime configuration and `listeners` containing `target_port` and `proxy_port`. Each key produces both the server's tunnel entry and its `load_balancers` entry with `provider = "tunnel"`; callers do not provide a second listener map. The server configuration and derived proxy snapshots remain separate contracts.
 
 Secret values are not persisted in shared Nstance state and must not appear in generated Terraform values, process arguments, logs, gRPC messages, or world-readable files. `nstance-server tunnel` resolves current source contents whenever it starts a tunnel Pod; the unprivileged server process has no tunnel secret or storage resolution path.
 
-Provider-specific images and configuration are generated by deployment tooling and consumed by containers. Nstance and vmconfig code remain provider-neutral. Production control-plane tunnels remain VM-lifecycle-owned and do not use this desired-state protocol.
+Provider-specific images and configuration are generated by deployment tooling and consumed by containers. Nstance and vmconfig code remain provider-neutral. Node tunnels remain VM-lifecycle-owned and do not use this desired-state protocol.
 
 ## Configuration
 
@@ -337,9 +344,21 @@ Podplane cluster configuration has one optional singular `cluster.tunnel` config
 - absent: use provider-default NLB exposure for both Kubernetes API and ingress;
 - present: use tunnels for both Kubernetes API and ingress, generating no NLB resources or registrations.
 
+```jsonc
+"tunnel": {
+  "kind": "cloudflare",
+  "id": "00000000-0000-4000-8000-000000000001",
+  "credential_secret": "tunnel-credentials"
+}
+```
+
+The administrator creates and manages the tunnel, its DNS records, and edge redirects. Podplane neither creates nor adopts those resources into Terraform state. It resolves the digest-pinned cloudflared image from each selected VM manifest's images, not a user-configurable tunnel image field. One existing tunnel ID and logical credential-secret reference are shared by node and `nst` processes.
+
+Create the credential secret before applying infrastructure. With the default cluster prefix, `tunnel-credentials` resolves to `/<cluster-id>/tunnel-credentials` in AWS Parameter Store or `<cluster-id>-tunnel-credentials` in Google Secret Manager. Terraform carries only this reference, never the credential payload.
+
 Podplane has no per-endpoint routing selectors, custom third exposure mode, or mixed API-NLB/ingress-tunnel mode. It defines stable endpoints within the selected mode. Changing NLB/tunnel mode requires infrastructure deletion and redeployment; an in-place switch is unsupported. Preserving Netsy data alone must not be described as a complete state-preserving migration. NAT mode is independent and retains the switching contract in [NAT.md](./NAT.md).
 
-The singular user config does not merge production and wake tunnel processes or credentials. They remain separate internally. Nstance's provider-neutral multi-entry `tunnels` block, logical `load_balancers`, and derived runtime listener contracts above remain unchanged; these are generated/internal contracts, not Podplane per-endpoint selectors.
+The singular user config does not merge node and `nst` process lifecycles; it shares their tunnel identity and credential reference. Nstance's provider-neutral multi-entry `tunnels` block, logical `load_balancers`, and derived runtime listener contracts above remain unchanged; these are generated/internal contracts, not Podplane per-endpoint selectors.
 
 In NLB mode, Podplane generates one target-group or frontend entry for each exposed API or ingress listener and assigns its logical load balancer to the appropriate control-plane or ingress group. In tunnel mode, it generates tunnel routing entries instead. Nstance derives proxy listeners from that data. NLB ingress uses ports 80 and 443; tunnel ingress uses only 443 because the tunnel provider handles HTTP-to-HTTPS redirection.
 
@@ -347,13 +366,17 @@ Validation requires public/direct external placement for `nst` VMs whenever Podp
 
 Supported Podplane AWS/Google `recommended` deployments generate API and ingress routes capable of reaching `nstance-server proxy` in either mode without a sleep-policy flag. Podplane user config has no `SleepPolicy` and generates no policy/timing overrides; automatic sleep remains disabled by default and manual CLI sleep remains supported. Nstance and Components retain their own policy settings. Generic Nstance deployments require a proxy-reachable exposure method or a guaranteed `wake_at` for recovery; Podplane must not allow an indefinitely sleeping cluster with no wake path.
 
+### Proposed credential preflight
+
+Neither `cluster create` nor generated Terraform currently checks whether the credential secret exists. A metadata-only preflight is under consideration: use existing metadata permissions only, never add IAM access or fall back to reading credential values. Whether denied metadata access should warn or fail remains unresolved. Secret existence alone would not establish valid contents or runtime access.
+
 ## Implementation areas
 
 - **Podplane CLI:** exposure config, ACME/tunnel exclusion, generated Terraform, node ingress certificate templates, certificate-source and operator seed values, and endpoint outputs.
 - **Nstance Terraform modules:** port-aware AWS target groups and Google Cloud regional external passthrough NLBs, `GCE_VM_IP` NEGs, forwarding-rule metadata, firewall rules, and health checks.
 - **Nstance server:** versioned proxy service, lease-based tunnel desired state, target membership, and ordered transitions; no tunnel workload or provider configuration delivery.
 - **Nstance tunnel supervisor:** root-controlled config and file resolution, outbound Unix gRPC stream, lease enforcement, hardened static-Pod generation, readiness, and restart/backoff.
-- **vmconfig:** VM-lifecycle-owned production `knc` tunnels; secure, atomic node-local ingress bundle delivery; installation and hardening of separate `nstance-server proxy` and `nstance-server tunnel` processes; and provider-neutral local routing.
+- **vmconfig:** VM-lifecycle-owned node tunnels; secure, atomic node-local ingress bundle delivery; installation and hardening of separate `nstance-server proxy` and `nstance-server tunnel` processes; and provider-neutral local routing.
 - **Podplane operator/SDS:** preserve NLB issuance and renewal; extend SDS file loading and SAN validation for one node-local multi-domain certificate. The existing empty-domains configuration disables tunnel-mode issuance.
 - **Components/Envoy Gateway:** select node-local or CSI certificate delivery, share the node-local SDS resource across listeners, and retain control-plane host exposure on port 443 for tunnels and ports 80/443 for NLBs; no kube-apiserver proxying.
 

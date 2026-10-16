@@ -10,9 +10,9 @@ Scale-to-zero should feel like **Wake-on-LAN for Kubernetes**. Podplane may stop
 - an external Envoy Gateway ingress request;
 - an upcoming CronJob.
 
-Nstance Server VMs remain running by default, normally one per zone/shard. They can use very small instance types because they provide the durable control plane while Kubernetes is asleep.
+Nstance Server VMs remain running by default, normally one per zone/shard. They can use very small instance types because they provide the durable control plane while Kubernetes is asleep. Their `nst` configuration is provisioned once; changing it rolls the VMs rather than applying an agent runtime update.
 
-They remain in private service subnets by default. Podplane Managed NAT places them in public service subnets/direct external egress as described in [NAT.md](./NAT.md), allowing tunnels to remain available while tenant groups are asleep. Changing this placement may rotate Nstance Server VMs but never Kubernetes nodes.
+They remain in private service subnets by default. `cluster.nat.mode = "nstance"` places them in public service subnets/direct external egress as described in [NAT.md](./NAT.md), allowing tunnels to remain available while tenant groups are asleep. Changing this placement may rotate Nstance Server VMs but never Kubernetes nodes. NAT mode (`provider` or `nstance`) is independent of using NLBs or tunnels.
 
 ## Durable tenant state
 
@@ -48,7 +48,9 @@ The shard leader reconciles its local record and resumes unfinished work after l
 
 Local wake-tunnel ownership is deliberately ephemeral rather than part of durable tenant state. The privileged root `nstance-server tunnel` process initiates its local Unix gRPC stream to the unprivileged server process, independently reads the same root-controlled shard configuration, and resolves tunnel secret/storage files itself. The shard leader sends only allowlisted tunnel name, desired running/stopped state, revision, and a renewable lease; it never sends images, commands, mounts, manifests, secrets, or provider details. Heartbeats renew authority while leadership is held. Explicit leadership loss revokes immediately; an ambiguous disconnect retains current state only for the bounded lease while reconnecting, then stops fail-closed. A restarted supervisor removes stale manifests before loading configuration because its leases were lost. The new leader waits for matching revision readiness before continuing destructive reconciliation. Nstance maintains no distributed old/new-leader tunnel handoff or lifecycle state files.
 
-Tunnel ingress uses one node-local certificate/keypair per Envoy-capable node, signed by the existing Nstance cluster CA and covering all configured apex/wildcard domains, localhost, both loopback IPs, and that node's assigned IPv4/IPv6 addresses. The agent provisioning mechanism matches kube-apiserver's; the Podplane operator performs neither ingress fallback nor ACME issuance in tunnel mode. Both production and sleep tunnels trust the public cluster CA and verify the configured origin hostname. After wake, the proxy forwards TLS unchanged to a newly provisioned node's certificate, so recovery needs neither an old node's private key nor operator ingress issuance. NLB deployments retain operator-owned fallback/ACME bundles. See [LB.md](./LB.md#ingress-certificates-and-sds) for certificate delivery, lifetime, and SDS requirements.
+Node and `nst` tunnel processes use the same existing user-managed tunnel ID and pre-created credential-secret reference; only their local origins and lifecycles differ. Podplane does not provision the tunnel or read its credentials through Terraform. See [LB.md](./LB.md#configuration) for setup and the unimplemented metadata-only preflight proposal.
+
+Tunnel ingress uses one node-local certificate/keypair per Envoy-capable node, signed by the existing Nstance cluster CA and covering all configured apex/wildcard domains, localhost, both loopback IPs, and that node's assigned IPv4/IPv6 addresses. The agent provisioning mechanism matches kube-apiserver's; the Podplane operator performs neither ingress fallback nor ACME issuance in tunnel mode. Both node and `nst` tunnels trust the public cluster CA and verify the configured origin hostname. After wake, the proxy forwards TLS unchanged to a newly provisioned node's certificate, so recovery needs neither an old node's private key nor operator ingress issuance. NLB deployments retain operator-owned fallback/ACME bundles. See [LB.md](./LB.md#ingress-certificates-and-sds) for certificate delivery, lifetime, and SDS requirements.
 
 ## Supported topologies
 
@@ -148,7 +150,7 @@ Wake is deduplicated within a shard by a durable compare-and-swap that removes t
 4. Nstance waits for any configured group to provide an agent-healthy instance with the target port ready, then returns its private address.
 5. `nstance-server proxy` forwards held connections to that address.
 6. Once Kubernetes starts, nstance-operator wakes any other shards required by MachinePools.
-7. Nstance waits for production NLB targets to become provider-health-check healthy and routable. For tunnel exposure, it waits for ordinary fresh control-plane agent health and the requested upstream TCP port; production control-plane tunnels remain VM-lifecycle-owned and outside Nstance control. It then bypasses `nstance-server proxy`, allowing existing proxied connections to finish there. If readiness times out, it retains the proxy path and continues reconciliation. For the local `nst` wake tunnel, Nstance renews only the allowlisted name, desired running/stopped state, revision, and bounded lease over the supervisor-initiated Unix gRPC stream.
+7. Nstance waits for production NLB targets to become provider-health-check healthy and routable. For tunnel exposure, it waits for ordinary fresh control-plane agent health and the requested upstream TCP port; node tunnels remain VM-lifecycle-owned and outside Nstance control. It then bypasses `nstance-server proxy`, allowing existing proxied connections to finish there. If readiness times out, it retains the proxy path and continues reconciliation. For the local `nst` wake tunnel, Nstance renews only the allowlisted name, desired running/stopped state, revision, and bounded lease over the supervisor-initiated Unix gRPC stream.
 
 The local `nstance-server proxy` uses one root-owned, proxy-accessible Unix gRPC control socket for its versioned listener stream and listener-scoped `WakeTenant`; these are the only proxy-facing operations. On stream loss it retains the last valid snapshot only during a brief reconnect window and stops leader-owned work. Nstance-server remains inaccessible from the public network, and no proxy configuration is persisted.
 
@@ -194,7 +196,7 @@ Normal sleep applies the automatic-sleep guards. `--force` bypasses node-count, 
 - **Nstance server:** durable per-tenant shard state, timers, final busy check, local reconciliation, and narrow proxy/supervisor Unix gRPC control streams.
 - **Nstance tunnel supervisor:** privileged root config/file resolution, supervisor-initiated control stream, renewable-lease enforcement, hardened kubelet static-Pod generation, and readiness/restart handling.
 - **Nstance agent:** read-only pinned-map collection and eBPF counter/error reporting.
-- **vmconfig:** dormant-by-default `knc`/`knd` eBPF connection counters, bpftool oneshot loader, pin permissions, VM-lifecycle-owned production `knc` tunnels, `nst` kind, and installation/hardening of separate optional `nstance-server proxy` and `nstance-server tunnel` processes.
+- **vmconfig:** dormant-by-default `knc`/`knd` eBPF connection counters, bpftool oneshot loader, pin permissions, VM-lifecycle-owned node tunnels, provision-once `nst` configuration, and installation/hardening of separate optional `nstance-server proxy` and `nstance-server tunnel` processes.
 - **Podplane CLI:** wake-capable routing for supported recommended deployments and the annotation-based manual sleep command; no user `SleepPolicy` or generated policy/timing overrides.
 - **Components:** deploy/configure nstance-operator and the required operator permissions.
 

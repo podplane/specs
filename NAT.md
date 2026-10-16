@@ -4,24 +4,50 @@
 
 ## Goal
 
-Podplane can use either Cloud Managed NAT or Podplane Managed NAT VMs without changing the cluster subnet model. AWS and Google Cloud use provider-native routing, but expose the same Podplane configuration and lifecycle.
+Podplane can use either provider-managed NAT or Nstance-managed NAT VMs without changing the cluster subnet model. AWS and Google Cloud use provider-native routing, but expose the same Podplane configuration and lifecycle.
+
+## Podplane configuration
+
+`cluster.nat.mode` selects `provider` (the default) or `nstance`, independently of NLBs or tunnels. For Nstance-managed NAT, Podplane exposes only deployment settings and the default Kubernetes tenant's group and instance-type ladder:
+
+```jsonc
+"nat": {
+  "mode": "nstance",
+  "fixed_public_ipv4_count": 2,
+  "groups": {
+    "nat": {
+      "arch": "arm64",
+      "instance_type": "t4g.small",
+      "subnet_pool": "public"
+    }
+  },
+  "tenants": {
+    "default": {
+      "group": "nat",
+      "instance_type_ladder": ["t4g.small", "t4g.medium", "t4g.large"]
+    }
+  }
+}
+```
+
+The subnet pool must provide a public NAT service subnet in every shard's zone. `fixed_public_ipv4_count` defaults to zero and reserves that many static public IPv4 addresses for each NAT service subnet, not each node subnet or cluster. Podplane passes the resulting address references into Nstance; users do not provide `public_addresses` in cluster config. Only the `default` Kubernetes tenant is currently supported by Podplane. Group size is derived by Nstance, and timing, thresholds, and replacement policy use Nstance defaults rather than additional Podplane fields.
 
 ## Network model
 
-- Node IPv4 subnets are `/26`, providing 59 usable addresses on AWS and 60 on Google Cloud.
+- New node IPv4 subnets default to `/26`, providing 59 usable addresses on AWS and 60 on Google Cloud. Existing configured subnet CIDRs are preserved.
     - Nstance conservatively calculates usable capacity as the subnet size minus AWS's five reserved addresses on both providers. It fills each sorted subnet to 90% of that capacity before using the next, targeting 53 nodes for `/26`.
     - Once all configured subnets are at 90%, it should round-robin until it finds an available slot.
     - As you will learn, this will reduce the total number of required Podplane Managed NAT instances.
 - Each populated node subnet has one dedicated NAT VM in a public/NAT service subnet in the same zone.
-- One generated OpenTofu/Terraform variable selects `cloud-managed` or `podplane-managed` NAT. Reapplying changes Cloud Managed NAT resources, route configuration, Nstance configuration, and required NAT VMs; node-subnet definitions remain unchanged.
+- One generated OpenTofu/Terraform variable, `nat_mode`, selects `provider` or `nstance`, matching cluster config. Reapplying changes Cloud Managed NAT resources, route configuration, Nstance configuration, and required NAT VMs; node-subnet definitions remain unchanged. In this spec, Cloud Managed means provider-managed NAT and Podplane Managed means Nstance-managed NAT.
     - This means cluster operators can switch between Cloud Managed NAT and Podplane Managed NAT without any cluster node changes or rotations. Cloud Managed to Podplane Managed causes a temporary IPv4 egress outage while Nstance reconciles.
 
 Podplane Managed NAT always places `nst` VMs in public service subnets on AWS and gives them external IPv4 addresses on Google Cloud. Inbound access remains denied except where explicitly required. Enabling Podplane Managed NAT may rotate Nstance-server VMs but not Kubernetes nodes.
 
 Dedicated NAT VMs normally use their provider-assigned public IPv4 addresses.
-When stable egress allowlisting is required, the cluster administrator may
-configure fixed public IPv4 addresses per zone/shard. OpenTofu/Terraform
-pre-provisions those addresses and passes them directly in each tenant's NAT
+When stable egress allowlisting is required, the cluster administrator sets
+`fixed_public_ipv4_count` per NAT service subnet. OpenTofu/Terraform
+pre-provisions those addresses and passes them directly in each shard's tenant NAT
 configuration:
 
 - AWS uses an Elastic IP reassociated with the active VM's primary ENI.
@@ -77,7 +103,7 @@ optional fixed public IPv4 in the same way as NAT44 traffic.
 
 ## Nstance NAT group
 
-Each shard's Nstance configuration identifies at most one NAT group per tenant through a top-level `nat` map:
+Each shard's Nstance configuration identifies at most one NAT group per tenant through a top-level `nat` map. The following is Nstance's runtime contract, not Podplane cluster config; Podplane supplies the group, ladder, and generated address references and leaves the policy fields at their defaults:
 
 ```jsonc
 "groups": {

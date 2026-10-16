@@ -22,7 +22,9 @@ not a grant of host-root privileges.
 
 ## Non-goals
 
-- A namespace-wide runc default or automatic runtime detection.
+- A runc default for tenant namespaces, or automatic runtime detection. The only
+  runc default is the administrator-owned platform allowlist described in
+  [Platform workloads and bootstrap](#platform-workloads-and-bootstrap).
 - Per-application approval resources, expiring grants, or an approval controller.
 - Changing Podplane's Pod Security levels or standard RBAC group bindings.
 - Treating root inside a container as a reason to automatically select runc.
@@ -131,6 +133,17 @@ These templates target managed installations with RuntimeClasses installed. They
 must not silently omit their runtime selection or fall back to runc when deployed
 into a bare environment without those resources.
 
+Template behavior must work under gVisor, which does not deliver inotify events
+for files changed outside the sandbox (see
+[gVisor compatibility](#gvisor-compatibility)). Certificate and configuration
+reloads must not wait for inotify events on projected volumes. Under gVisor, the
+`web` chart's Envoy sidecar adopts rotated serving certificates through a
+reloader sidecar that polls the projected certificate and, when it changes,
+renames a marker file inside the sandbox into a Pod-shared volume that Envoy
+watches. The reloader never copies certificate or key material. Under runc,
+Envoy watches the projected certificate directly and the chart omits the
+reloader.
+
 ### Grant scope
 
 Permission applies to everyone who can create workloads in that namespace, not
@@ -215,7 +228,8 @@ Admission must enforce the namespace entitlement and runtime allowlist; restrict
 writes to RuntimeClass objects alone is insufficient.
 
 Use the native MutatingAdmissionPolicy and ValidatingAdmissionPolicy mechanisms
-already used by `platform-rbac`. Policies must fail closed for evaluation errors
+already used by `platform-rbac`, in a separate `platform-runtime` chart that owns
+the RuntimeClasses and runtime policies. Policies must fail closed for evaluation errors
 and must be installed with enforcing bindings. RuntimeClass definitions, runtime
 configuration, admission policies, and their bindings remain administrator-owned.
 
@@ -233,6 +247,11 @@ Tenants must not gain direct access to containerd, node files, static-Pod
 manifests, or the platform's privileged deployment automation. Those interfaces
 can bypass API admission and remain outside the tenant security boundary.
 
+The platform runc default allowlist is part of the administrator-owned policy
+configuration. It may name only `platform-*` namespaces, is never derived from the
+runc permission label, and does not authorize runc: Pods it defaults to runc are
+still rejected unless their namespace has permission.
+
 ## Runtime defaulting architecture
 
 Containerd retains runc as its low-level default. vmconfig installs both runtime
@@ -240,16 +259,18 @@ handlers on `knd` and `knc` Kubernetes nodes, but not on `nst` or `nat` instance
 Trusted VM-managed static Pods continue to use the node default without depending
 on RuntimeClass objects or API admission.
 
-For API-created workloads, a MutatingAdmissionPolicy sets an omitted
-`spec.runtimeClassName` to `gvisor`. A ValidatingAdmissionPolicy checks the final
-selection: `gvisor`, or explicit `runc` with namespace permission. It rejects a
-missing or empty final selection, so a defaulting failure cannot silently reach
-containerd's runc default.
+For API-created workloads, a single MutatingAdmissionPolicy sets an omitted
+`spec.runtimeClassName`: to `runc` in namespaces on the platform runc default
+allowlist, and to `gvisor` everywhere else. One policy makes both choices so two
+defaulting policies cannot race for the same field. A ValidatingAdmissionPolicy
+checks the final selection: `gvisor`, or `runc` with namespace permission. It
+rejects a missing or empty final selection, so a defaulting failure cannot
+silently reach containerd's runc default.
 
 Policy presence is part of the managed platform's security guarantee. Removing
 enforcement is an administrative security change, not a supported runtime
-selection mechanism. Platform workloads follow the same explicit selection and
-namespace-permission model, with the static-Pod mirror exception below.
+selection mechanism. Platform workloads follow the same namespace-permission
+model, with the platform allowlist and the static-Pod mirror exception below.
 
 ### Kubernetes admission behavior
 
@@ -279,15 +300,35 @@ verify correct policy wiring, not whether native admission can support the desig
 ## Platform workloads and bootstrap
 
 The tenant contract does not require every host-integrated platform process to
-run inside gVisor. Cilium, storage drivers, host-mounted DNS configuration,
-ingress components, and tunnel static Pods require explicit compatibility review.
+run inside gVisor. A platform workload uses runc only when it needs host
+integration gVisor cannot provide, as established in
+[gVisor compatibility](#gvisor-compatibility): the host network namespace, host
+Unix sockets in either direction, mount propagation, or host devices and kernel
+interfaces such as `/dev/kmsg` and BPF. A privileged Pod Security level is not
+itself a reason: host ports and read-only host files work under gVisor.
 
-API-managed platform workloads requiring native execution must explicitly select
-`runtimeClassName: runc`. Their namespaces receive the same
-`runtime.podplane.dev/runc: allowed` permission through trusted platform
-configuration. No platform-wide runtime bypass is introduced. Compatible platform
-workloads use gVisor; neither namespace permission nor a privileged Pod Security
-level changes the default.
+| Component | Host integration | Runtime |
+| --- | --- | --- |
+| Cilium agent and operator | Host networking, BPF, bidirectional mount propagation | runc |
+| AWS EBS CSI driver node plugin | Bidirectional mount propagation, kubelet plugin sockets, devices | runc |
+| AWS EBS CSI driver controller | None, but its containers share a socket at a mount path ending in `/` (see below) | runc until the chart or gVisor is fixed |
+| Secrets Store CSI driver | Bidirectional mount propagation, kubelet plugin and provider sockets | runc |
+| Secrets Store providers (AWS, Google, OpenBao, Vault) | Serve a Unix socket to the CSI driver from a host directory | runc |
+| Node Problem Detector | `/dev/kmsg`, the containerd socket | runc |
+| CoreDNS | Read-only host `resolv.conf` | gVisor |
+| Envoy Gateway proxies | Host ports, polled read-only host certificates, a sidecar socket shared through an emptyDir with a gVisor mount hint | gVisor |
+| Other platform components | None | gVisor |
+
+Upstream charts for the runc components do not expose a RuntimeClass setting, so
+`platform-runtime` holds a platform runc default allowlist naming their namespaces,
+and those namespaces receive `runtime.podplane.dev/runc: allowed` through trusted
+platform configuration. Both are required: the allowlist selects runc and the
+label permits it. Components keep the two lists identical. Every Pod in an
+allowlisted namespace defaults to runc, so a namespace is allowlisted only when
+all of its Pods need runc. Charts may instead select a RuntimeClass explicitly in
+their Pod templates. Do not post-render or patch upstream charts to select a runtime.
+Neither namespace permission nor a privileged Pod Security level changes the
+default for any namespace outside the allowlist.
 
 Preserve existing restrictions on creating and accessing `kube-*` and
 `platform-*` namespaces. Trusted platform automation may manage platform namespace
@@ -306,10 +347,11 @@ Fresh managed-cluster bootstrap must proceed in this order:
    infrastructure. All Kubernetes nodes, including newly provisioned nodes, must
    have gVisor available before accepting workload scheduling.
 2. Bootstrap creates required platform namespaces and their native-runtime
-   permissions, then installs RuntimeClasses and `platform-rbac` policies with
-   enforcing bindings before starting API-managed platform workloads.
-3. Platform workloads start with explicit runc selections where required; omitted
-   selections default to gVisor. Bootstrap must not depend on Cilium or Flux to
+   permissions, then installs the `platform-runtime` RuntimeClasses and policies
+   with enforcing bindings before starting API-managed platform workloads.
+   `platform-rbac` continues to be installed by Flux.
+3. Platform workloads start in their defaulted runtimes: runc in allowlisted
+   namespaces and gVisor elsewhere. Bootstrap must not depend on Cilium or Flux to
    install policies that need to precede them. Flux subsequently reconciles the
    same platform policy resources rather than a second policy implementation.
 4. Managed platform readiness requires runtime defaulting and enforcement to be
@@ -317,6 +359,40 @@ Fresh managed-cluster bootstrap must proceed in this order:
 
 No temporary tenant bypass, automatic mass restart, or legacy migration phase is
 required for fresh-cluster bootstrap.
+
+## gVisor compatibility
+
+Podplane's pinned gVisor release `release-20261005.0`, using systrap on
+Kubernetes 1.37 with containerd and the systemd cgroup driver, behaves as follows
+for Pods running in the `gvisor` RuntimeClass:
+
+| Capability | Behavior |
+| --- | --- |
+| Host networking (`hostNetwork`) | Does not work; listeners are unreachable, including over loopback. |
+| Host ports (`hostPort`) | Work; the host forwards to the Pod network. |
+| Reading host paths, ConfigMaps, Secrets, and projected volumes | Reads observe changes made outside the sandbox, including atomic replacement. |
+| inotify for changes made outside the sandbox | No events are delivered. |
+| Host Unix sockets | Unavailable in both directions: sockets bound in the sandbox are not created on the host, and host sockets cannot be connected to. |
+| Unix sockets on an emptyDir shared by containers | Fail by default because each container sees a separate view of the volume; work with gVisor mount hints. |
+| Shared mounts at a path ending in `/` | Fail: the second container cannot be created (`failed to create directory mountpoint ...: file exists`). |
+| Bidirectional mount propagation | Refused at container creation. |
+| `/dev/kmsg` | Unreadable, even for privileged containers. |
+| Pod resource limits | Kubelet's Pod cgroup limits apply to the sandbox, including memory OOM kills. |
+
+vmconfig's containerd configuration forwards Pod annotations matching
+`dev.gvisor.spec.mount.*` to runsc. A Pod shares an emptyDir across its
+containers with `dev.gvisor.spec.mount.<volume>.share: pod` and
+`dev.gvisor.spec.mount.<volume>.type: tmpfs`. The shim resolves hints against the
+Pod's own volumes, so a hint cannot add a mount or expose another host path.
+Charts using hints must mount the shared volume at a path without a trailing
+`/`. The AWS EBS CSI chart hardcodes `/var/lib/csi/sockets/pluginproxy/` for its
+controller's shared socket volume, so the controller stays in runc until the
+chart drops the trailing slash or gVisor accepts it.
+Placing the sandbox in the Pod's systemd slice does not require runsc's
+experimental `systemd-cgroup` option, which Podplane does not set.
+
+User documentation must describe these differences, including how to share
+sidecar sockets and that file reloads must poll.
 
 ## Bare and managed installations
 
@@ -348,9 +424,9 @@ components operate outside the managed security guarantee.
 
 | Repository | Responsibility |
 | --- | --- |
-| `github.com/podplane/vmconfig` | Verified gVisor dependencies, installation, node runtime handlers, architecture support, static-Pod compatibility, and runtime health checks |
-| `github.com/podplane/components` | RuntimeClasses, namespace permission protection, Pod runtime defaulting and validation, platform exceptions, and bootstrap ordering |
-| `github.com/podplane/templates` | Explicit gVisor defaults and configurable runtime selection in the web and worker charts, including values schemas, documentation, and rendering tests |
+| `github.com/podplane/vmconfig` | Verified gVisor dependencies, installation, node runtime handlers including mount-hint forwarding, architecture support, static-Pod compatibility, and runtime health checks |
+| `github.com/podplane/components` | RuntimeClasses, namespace permission protection, Pod runtime defaulting and validation, the platform runc default allowlist, and bootstrap ordering |
+| `github.com/podplane/templates` | Explicit gVisor defaults and configurable runtime selection in the web and worker charts, including values schemas, documentation, rendering tests, and gVisor-compatible certificate reloading |
 | `github.com/podplane/podplane` | User documentation and any CLI or readiness integration needed to expose the agreed contract |
 
 No operator controller is required merely to authorize runtime selection.
@@ -394,11 +470,12 @@ template or dependency kind set, which also covers `nst`.
 2. Add RuntimeClasses and fail-closed admission policy in components, including
    omitted-field defaulting, explicit-empty rejection, namespace-label protection,
    and the runtime allowlist.
-3. Integrate early bootstrap installation, explicit platform exceptions, and
-   narrowly scoped static-Pod mirror handling. Verify a clean cluster reaches
+3. Integrate early bootstrap installation, the platform runc default allowlist,
+   and narrowly scoped static-Pod mirror handling. Verify a clean cluster reaches
    readiness without any temporary tenant bypass.
 4. Add `runtimeClassName: gvisor` defaults and explicit runc overrides to the web
-   and worker charts in `podplane/templates`, with schemas and rendering tests.
+   and worker charts in `podplane/templates`, with schemas and rendering tests,
+   and replace the `web` chart's inotify-based certificate reloading.
    Update Pod Security, RBAC, deployment, and troubleshooting documentation.
    Distinguish bare infrastructure readiness from managed platform readiness.
 5. Verify the complete contract on disposable fresh clusters, including bare and
@@ -446,8 +523,13 @@ and worker, exercising default and overridden runtime values.
 - A missing or failing gVisor handler causes a visible failure with no runc
   fallback. Admission errors fail closed.
 - Cilium networking, DNS, Flux, supported CSI/storage paths, ingress, and VM tunnel
-  static Pods work from clean bootstrap and after restart. Exercise approved
-  platform exceptions rather than making every platform workload native by default.
+  static Pods work from clean bootstrap and after restart, with each platform
+  component in the runtime the platform workloads table assigns it.
+- The platform runc default allowlist accepts only `platform-*` namespaces, and
+  allowlisted Pods without namespace permission are rejected.
+- Containers sharing a Unix socket through an emptyDir work under gVisor with
+  mount hints, including the platform Envoy proxies and their SDS sidecar.
+- The `web` chart's sidecar adopts rotated serving certificates under gVisor.
 - Static-Pod mirrors preserve the locally selected runtime; tenant requests with
   forged mirror metadata cannot bypass runtime policy.
 - Representative restricted-default applications work on amd64 and arm64,
