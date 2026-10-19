@@ -306,10 +306,10 @@ refs/heads/local-dev
 Then local bootstrap can use:
 
 ```sh
-make recommended
+make agentic
 ```
 
-When the local Git cache contains `~/.podplane/cache/deps/git/components.git`, the components repo `make recommended` target should default `PLATFORM_GIT_REPOSITORY_URL` to the VM-local HTTPS forwarding endpoint and `PLATFORM_GIT_REPOSITORY_BRANCH` to `local-dev`. Users can still override either environment variable explicitly for GitHub branches, forks, or other sources.
+When the local Git cache contains `~/.podplane/cache/deps/git/components.git`, the components repo `make platform` and `make agentic` targets should default `PLATFORM_GIT_REPOSITORY_URL` to the VM-local HTTPS forwarding endpoint and `PLATFORM_GIT_REPOSITORY_BRANCH` to `local-dev`. Users can still override either environment variable explicitly for GitHub branches, forks, or other sources.
 
 For local VM development, `<local-server>` concretely means the VM-local HTTPS forwarding endpoint, not the host-side dynamic HTTPS listener. The expected default URL shape is:
 
@@ -317,7 +317,7 @@ For local VM development, `<local-server>` concretely means the VM-local HTTPS f
 https://10.0.2.15:19443/git/components.git
 ```
 
-The stable port must match the `socat` service configured by the Podplane CLI/user-data path. `make recommended` may use `podplane local status --json` and read `.components.source.url` / `.components.source.ref.branch` when available instead of hardcoding the local VM node IP.
+The stable port must match the `socat` service configured by the Podplane CLI/user-data path. `make platform` and `make agentic` may use `podplane local status --json` and read `.components.source.url` / `.components.source.ref.branch` when available instead of hardcoding the local VM node IP.
 
 The `git-sync` target should include uncommitted working-tree changes, similar in spirit to the existing Kind `dev-sync` target.
 
@@ -341,7 +341,7 @@ The `git-sync` target should include uncommitted working-tree changes, similar i
 
 1. Update the components dependency manifest to include `components.source.url` and `components.source.ref.semver` for the released components repo version.
 2. Add `make git-sync` to snapshot (similar to how `dev-sync` works) the working tree into `~/.podplane/cache/deps/git/components.git` on branch `local-dev`.
-3. Change `make recommended` defaults so, when the local Git cache exists, it points `PLATFORM_GIT_REPOSITORY_URL` at `https://10.0.2.15:19443/git/components.git` and `PLATFORM_GIT_REPOSITORY_BRANCH` at `local-dev`, while preserving explicit env var overrides. Only read those defaults from `podplane local status --json` and never hard code them.
+3. Change `make platform` and `make agentic` defaults so, when the local Git cache exists, they point `PLATFORM_GIT_REPOSITORY_URL` at `https://10.0.2.15:19443/git/components.git` and `PLATFORM_GIT_REPOSITORY_BRANCH` at `local-dev`, while preserving explicit env var overrides. Only read those defaults from `podplane local status --json` and never hard code them.
 4. Keep existing Kind `dev-sync`/`dev-bootstrap` behavior unchanged.
 
 ### Validation
@@ -350,4 +350,4 @@ The `git-sync` target should include uncommitted working-tree changes, similar i
 2. Start the local HTTPS server and verify `gogit clone --depth 1 https://<host-local-server>/git/components.git` succeeds.
 3. In a local VM, verify the `socat` listener forwards `https://10.0.2.15:19443/git/components.git` to the current host-side HTTPS port and that TLS validates against the local VM node IP SAN.
 4. Verify Flux `GitRepository` becomes Ready against the VM-local forwarded URL.
-5. Verify `podplane local start` can reconcile recommended components without reaching GitHub when deps Git cache is populated.
+5. Verify `podplane local start` can reconcile default agentic components, and explicit platform components, without reaching GitHub when deps Git cache is populated.

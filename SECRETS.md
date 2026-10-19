@@ -2,9 +2,14 @@
 
 > **STATUS**: In review
 >
-> The implementation is complete and the local CLI-to-CSI path works. Remaining
-> review covers practical AWS backend and CSI verification, equivalent GCP and
-> production Vault/OpenBao verification where practical, and the required API,
+> The implementation is substantially complete and the local CLI-to-CSI path works.
+> Workload-prefix/verb-scoped fakevault tokens, GCP retained-version archive and
+> destroy handling, and Vault/OpenBao CSI auth-mount translation are implemented.
+> GCP updates may retain enabled history; archive disables all retained enabled
+> versions, restore enables only latest, and destroy rejects enabled versions.
+> Remaining review covers practical AWS backend and CSI
+> verification, equivalent GCP and production Vault/OpenBao verification where
+> practical, and the required API,
 > CLI, admission-policy, and lifecycle acceptance matrix.
 
 ## Goals
@@ -593,7 +598,7 @@ service:
   name: platform-podplane-operator
 ```
 
-TLS serving certificates follow [CERTS.md](./CERTS.md#platform-serving-certificates-and-ca-injection). The combined `podplane-operator` issues and rotates its aggregated API Service certificate directly from its CSI-mounted workload CA key, writing the keypair into a runtime volume. It cannot project a Pod Certificate signed by itself because initial issuance would block its own startup. The chart annotates the `APIService` with `certificates.podplane.dev/inject-ca-from: workload`, and the operator injects the workload CA bundle into `caBundle`. No cert-manager resources or Kubernetes TLS Secrets are used. Podplane Secrets is part of the platform/recommended components path and is not required for the minimal seed.
+TLS serving certificates follow [CERTS.md](./CERTS.md#platform-serving-certificates-and-ca-injection). The combined `podplane-operator` issues and rotates its aggregated API Service certificate directly from its CSI-mounted workload CA key, writing the keypair into a runtime volume. It cannot project a Pod Certificate signed by itself because initial issuance would block its own startup. The chart annotates the `APIService` with `certificates.podplane.dev/inject-ca-from: workload`, and the operator injects the workload CA bundle into `caBundle`. No cert-manager resources or Kubernetes TLS Secrets are used. Podplane Secrets is part of both the platform and agentic components paths and is not required for the minimal seed.
 
 The `platform-podplane-operator` Deployment must run exactly `1` replica by default and should not expose a normal autoscaling path. This is acceptable for Podplane Secrets traffic: secret writes are human/automation control-plane operations, and `SecretProviderBinding` reconciliation should be lightweight. A single correctly vertically scaled operator is simpler and safer than horizontally scaling the aggregated API while it uses an in-memory encryption key for client-side encrypting create/update request values.
 
@@ -963,7 +968,7 @@ Provider adapters should use the safest native deletion mode that makes the curr
 | --- | --- | --- | --- | --- |
 | AWS Secrets Manager | Schedule deletion with recovery window | `RestoreSecret` | `ForceDeleteWithoutRecovery`; recreate may need retry due eventual consistency | `archived` during recovery window | Yes; scheduled-for-deletion secrets are not directly accessible |
 | AWS Parameter Store | Not supported; archive delete should fail | Not supported | Delete parameter | Hidden after destroy | Yes |
-| GCP Secret Manager | Disable the active/latest version | Re-enable version | Destroy disabled archived version(s) | `archived` while disabled | Yes; `latest` does not fall back to an older enabled version |
+| GCP Secret Manager | Disable all retained enabled versions | Re-enable only latest | Destroy disabled archived version(s); reject if any version is enabled | `archived` while latest is disabled | Yes; `latest` does not fall back to an older enabled version |
 | Vault/OpenBao KV-v2 | Soft-delete latest version | Undelete latest version | Delete metadata for the logical key | `archived` while soft-deleted | Yes |
 
 If a provider uses a recoverable/archive-style delete, Podplane should expose restore for that provider/key within the provider-defined recovery window. Providers without native recovery should reject archive delete and require explicit destroy.
@@ -1409,7 +1414,7 @@ This is a new repository for the `podplane-operator` service and the main owner 
 - Implement Vault KV-v2 adapter.
 - Implement GCP Secret Manager adapter.
 - For Vault/OpenBao, support create, update, metadata-only list, soft delete of the latest/current version, undelete/restore, and destroy as KV-v2 metadata delete for the logical key; do not expose per-version operations.
-- For GCP Secret Manager, support create, update, metadata-only list, delete as disabling the active/latest version, restore as re-enabling that version, and destroy as destroying disabled archived version(s).
+- For GCP Secret Manager, support create, update, metadata-only list, delete as disabling all retained enabled versions, restore as re-enabling only latest, and destroy as destroying disabled archived version(s) after rejecting any enabled version.
 - Extend `SecretProviderBinding` rendering for Vault/OpenBao and upstream GCP SecretProviderClass formats; generated resources must avoid GKE managed add-on provider/driver shapes and provider-specific historical version references.
 
 ### Repository: `github.com/podplane/components`
@@ -1428,9 +1433,9 @@ This repository owns the platform component chart and component metadata needed 
 
 #### Components and policy metadata
 
-- Add component metadata for Secrets Store CSI Driver, provider charts, and `podplane-operator`, initially optional/not recommended until functional.
+- Add component metadata for Secrets Store CSI Driver, provider charts, and `podplane-operator`, initially optional and outside the platform/agentic profiles until functional.
 - Add default-on native CEL `ValidatingAdmissionPolicy` enforcing explicit non-empty `serviceAccountName` and `secretProviderClass == serviceAccountName` before or alongside any app template support for mounting Secrets Store CSI volumes. Do not add an operator webhook fallback; for unsupported Kubernetes versions, require an explicit compatibility decision or warning rather than silently weakening the default policy.
-- Promote `podplane-operator` and secrets components from optional/not recommended to the platform/recommended components path once the end-to-end feature is functional.
+- Promote `podplane-operator` and secrets components from optional to both the platform and agentic components paths once the end-to-end feature is functional.
 
 ### Repository: `github.com/podplane/templates`
 
@@ -1447,11 +1452,11 @@ This repository owns Podplane app template Helm charts and template manifest met
 
 ### Repository: `github.com/podplane/seedgen`
 
-This repository owns the seed generator rules used to decide which platform component records belong in minimal and recommended Podplane seeds.
+This repository owns the seed generator rules used to decide which platform component records belong in minimal, platform, and agentic Podplane seeds.
 
 #### Seed generation rules
 
-- Update seed include/exclude rules and expected-record checks as needed when `podplane-operator` and secrets components move into the platform/recommended components path.
+- Update seed include/exclude rules and expected-record checks as needed when `podplane-operator` and secrets components move into both the platform and agentic components paths.
 - Preserve the minimal seed's lightweight profile unless the secrets platform components are explicitly required there.
 
 ### Repository: `github.com/podplane/seeds`
@@ -1460,7 +1465,7 @@ This repository owns the generated Netsy seed snapshots and seed manifests downl
 
 Do not do these steps, but check that a human has:
 
-- Regenerate the recommended seed snapshot after the components chart includes `podplane-operator` and the secrets components in the recommended path.
+- Regenerate the platform and agentic seed snapshots after the components chart includes `podplane-operator` and the secrets components in both profiles.
 - Regenerate the minimal seed snapshot only if the implementation intentionally moves any secrets-related component into the minimal path.
 - Update seed manifests for any regenerated snapshots.
 
@@ -1521,7 +1526,7 @@ Run repository-local checks after implementation in each repo, then run cross-re
 
 #### `github.com/podplane/seedgen`
 
-- Add or update tests for seed include/exclude rules and expected-record checks covering any recommended-path secrets components.
+- Add or update tests for seed include/exclude rules and expected-record checks covering secrets components in both the platform and agentic profiles.
 
 #### `github.com/podplane/seeds`
 

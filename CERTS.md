@@ -3,11 +3,10 @@
 > **STATUS**: In review
 >
 > The cross-repository implementation is substantially complete. Remaining work:
-> align Seedgen expectations and regenerate the recommended seed without obsolete
-> cert-manager/Secret-based certificate resources; add the prescribed operational
-> alerts; and complete the Kubernetes 1.37 provider, projection, rotation, mTLS,
+> complete the Kubernetes 1.37 provider, projection, rotation, mTLS,
 > Service-identity, Envoy Gateway, delayed-install, and private-material acceptance
-> matrix before declaring the contract implemented.
+> matrix before declaring the contract implemented. Service-selector authorization
+> rechecks, retained-signer trust recovery, and operational metrics are implemented.
 
 This specification builds on [Kubernetes KEP-4317: Pod Certificates](https://github.com/kubernetes/enhancements/tree/master/keps/sig-auth/4317-pod-certificates), [KEP-3257: ClusterTrustBundles](https://github.com/kubernetes/enhancements/tree/master/keps/sig-auth/3257-cluster-trust-bundles), the [ClusterTrustBundle documentation](https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/#cluster-trust-bundles), and the SPIFFE [ID](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE-ID.md) and [X.509-SVID](https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md) specifications.
 
@@ -258,7 +257,7 @@ The API separately enforces `sign` on PCR status and `attest` on signer-linked t
 
 The workload CA is distinct from the Kubernetes cluster/control-plane CA and shared platform CA; using either would merge unrelated trust and compromise domains. Its initial signer is a dedicated Ed25519 workload CA key in `cluster.secrets.default_provider`, delivered only through Secrets Store CSI. The operator signs directly with Go's X.509 implementation and never creates a cert-manager `CertificateRequest` per Pod. cert-manager owns neither this key nor its CA certificate. An intermediate adds no isolation while root and intermediate remain online together.
 
-Every OpenTofu-managed `recommended`, `minimal`, and `none` cluster using AWS Secrets Manager, AWS SSM Parameter Store, or GCP Secret Manager creates or adopts the key before any cluster-specific seed, whether or not the operator is initially installed. When the infrastructure provider owns authorization, Podplane also creates an exact CSI provider-plugin read grant.
+Every OpenTofu-managed `agentic`, `platform`, `minimal`, and `none` cluster using AWS Secrets Manager, AWS SSM Parameter Store, or GCP Secret Manager creates or adopts the key before any cluster-specific seed, whether or not the operator is initially installed. When the infrastructure provider owns authorization, Podplane also creates an exact CSI provider-plugin read grant.
 
 Customers using an externally administered Vault or OpenBao KV-v2 backend must provision the key and equivalent read policy before creating the cluster. Podplane consumes it through the customer's existing Kubernetes/JWT integration and requires no Vault/OpenBao token outside the cluster. Installation and operator startup must never generate the key. Reject any other default provider before apply and never fall back to a Kubernetes Secret.
 
@@ -380,7 +379,7 @@ podplane_workload_certificate_trust_bundle_reconcile_errors_total
 
 Derive `mode` only from the validated annotation set. Never label Pod, namespace, Service, ServiceAccount, SPIFFE ID, PCR, serial, DNS name, or certificate. Logs may include namespaced PCR, requested Service, and stable result/reason, but no CSR, certificate, key, mounted value, or sensitive provisioning diagnostic.
 
-Also monitor `apiserver_resource_objects` and kubelet `kubelet_pod_certificate_states`. Alert on signer unready; pending/error for five minutes; overdue/expired projections; denial spikes; CA-load or bundle errors/drift; and less than one year of CA validity.
+Also expose or consume existing `apiserver_resource_objects` and kubelet `kubelet_pod_certificate_states` metrics where available. Certificate monitoring scope is metrics only; shipped alert rules and ServiceMonitor resources are not required. Operators may define their own scraping and alerting policy.
 
 Export public roots with:
 
@@ -396,8 +395,8 @@ kubectl get clustertrustbundle certificates.podplane.dev:workload:roots \
 3. **`github.com/podplane/vmconfig`**: establish Kubernetes 1.37 and verify stable PCR and ClusterTrustBundle APIs and projections without feature gates.
 4. **`github.com/podplane/operator`**: update Kubernetes libraries; add isolated signer configuration, CSI loading/readiness, CA renewal, filtered PCR and trust-bundle controllers, certificate and Service authorization, fixed operator-serving certificates, annotation-driven workload CA-bundle injection, metrics, and tests; add no provider-value clients.
 5. **`github.com/podplane/components`**: render the bootstrap class, read-only mount, signer/CTB and CA-injector RBAC, fixed operator-serving runtime volumes, Cluster API and Nstance projected serving certificates, and direct Envoy Gateway ClusterTrustBundle references; keep provider identity off the operator; order CSI driver/provider and operator before dependent components. Render no workload CA Secret, cert-manager resources or components, or trust-manager dependency. Envoy Gateway and operator-owned ingress certificates supersede the abandoned `platform-acme` transition; see [ACME.md](./ACME.md).
-6. **`github.com/podplane/seedgen`**: generate the non-secret resources and RBAC required when the recommended seed selects the operator; keep key provisioning outside generic seed records.
-7. **`github.com/podplane/seeds`**: publish the generated operator resources in the recommended seed and prove reusable seed artifacts contain no CA private key or external secret value.
+6. **`github.com/podplane/seedgen`**: generate the non-secret resources and RBAC required when the platform or agentic seed selects the operator; keep key provisioning outside generic seed records.
+7. **`github.com/podplane/seeds`**: publish the generated operator resources in the platform and agentic seeds and prove reusable seed artifacts contain no CA private key or external secret value.
 8. **`github.com/podplane/templates`**: replace cert-manager CSI and Secret-backed workload certificates with Kubernetes 1.37 `podCertificate` and `clusterTrustBundle` projections; use separate Service and SPIFFE identities where both are required, and reference the workload ClusterTrustBundle directly from Envoy Gateway backend policies.
 
 ## Verification
@@ -415,7 +414,7 @@ Unit, provider, and chart tests must cover:
 
 An integrated Kubernetes 1.37 test must prove:
 
-1. `recommended`, `minimal`, and `none` managed clusters all provision the external key and plugin grant without plaintext in OpenTofu artifacts or state; later `podplane install` on `minimal` consumes that original key.
+1. `agentic`, `platform`, `minimal`, and `none` managed clusters all provision the external key and plugin grant without plaintext in OpenTofu artifacts or state; later `podplane install` on `minimal` consumes that original key.
 2. Initial Pod blocking with ServiceAccount-token automount disabled, bundle/key match, exact SVID requirements, stable v1 APIs, trust projection including omitted-versus-empty selector behavior, and clear readiness failure when APIs are absent.
 3. Pod-to-Pod mTLS authorizing exact URI SANs, external client mTLS, and rejection by the unrelated platform CA.
 4. Mode `spiffe` with and without a Service identity, mode `service`, and separately projected SPIFFE and Service certificates; prove `service` mode omits the URI, `spiffe` mode retains it when Service DNS SANs are added, both modes contain exactly four DNS SANs when a Service is requested, separate files have independent matching keypairs, and malformed, additional, cross-namespace, selectorless, mismatched, absent, and racing Service cases behave correctly with bounded validity after authorization changes.

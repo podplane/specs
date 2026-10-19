@@ -4,8 +4,8 @@
 >
 > Most configuration, AWS DNS, and endpoint propagation work is implemented,
 > including `REGISTRY_HOSTNAME` propagation through generated mutable VM
-> configuration. Remaining work: preserve listener-specific pool registration in
-> Google Cloud and complete the shared-AWS, mutable-hostname, kubeconfig, DNS,
+> configuration. Logical load balancers use common backend membership as defined
+> in [LB.md](./LB.md). Remaining work: complete the shared-AWS, mutable-hostname, kubeconfig, DNS,
 > registry, and advertised-provider acceptance matrix.
 
 ## Goal
@@ -63,8 +63,7 @@ Load balancers are a named map under each infrastructure provider. Domain and Ku
           "public": true,
           "subnets": "public",
           "listeners": [
-            { "port": 443, "pool": "ingress" },
-            { "port": 6443, "pool": "control-plane" }
+            { "port": 443, "pool": "ingress" }
           ]
         },
         "kubernetes-api": {
@@ -82,7 +81,7 @@ Load balancers are a named map under each infrastructure provider. Domain and Ku
 
 `domains[].load_balancer` selects the target for that domain's apex and wildcard records and defaults to `main`. `kubernetes.api_load_balancer` independently selects the target for the exact API hostname. It has no implicit default: omitting it disables managed API load-balancer and DNS wiring. This permits the API and application ingress to share a load balancer, use separate load balancers, or leave API connectivity to custom infrastructure.
 
-Each load balancer declares its listeners explicitly. A listener's `port` is the external port, `target_port` is the port on its target VMs and defaults to `port`, and `pool` selects the VMs registered with that listener's target group. The load balancer's `subnets` field independently selects its placement subnet role.
+Each load balancer declares its listeners explicitly. A listener's `port` is the external port, `target_port` is the port on its target VMs and defaults to `port`, and `pool` selects its backend pool. All listeners under one logical load-balancer key must use the same pool on both AWS and Google Cloud. Different backend membership requires separate logical keys, as in the ingress/API example above; see [LB.md](./LB.md#network-load-balancers). The load balancer's `subnets` field independently selects its placement subnet role.
 
 Podplane validates the listeners required by higher-level configuration:
 
@@ -90,7 +89,7 @@ Podplane validates the listeners required by higher-level configuration:
 - The Kubernetes API requires `api_port -> 6443` targeting the `control-plane` pool on its selected load balancer.
 - Listener ports must be unique within a load balancer.
 
-When a domain is configured, the cluster-create wizard creates `main` with explicit HTTPS and Kubernetes API listeners and selects it for the Kubernetes API. The wizard creates only the `control-plane` pool so that a size-one cluster remains a single-VM topology; both listeners therefore target `control-plane`. A configuration with a dedicated `ingress` pool must target the HTTPS listener at that pool, as in the example above. Advanced config may define dedicated ingress pools, more load balancers, and arbitrary listeners.
+When a domain is configured, the cluster-create wizard creates `main` with explicit HTTPS and Kubernetes API listeners and selects it for the Kubernetes API. The wizard creates only the `control-plane` pool so that a size-one cluster remains a single-VM topology; both listeners therefore target `control-plane`. A configuration with a dedicated `ingress` pool must use separate logical keys for ingress and API membership, as in the example above, and select `kubernetes-api` for `kubernetes.api_load_balancer`. Advanced config may define dedicated ingress pools, more load balancers, and arbitrary listeners with common membership per key.
 
 ## DNS records
 
@@ -178,7 +177,7 @@ The wizard asks only:
 3. The optional ACME account email when the selected DNS provider supports ACME.
 4. The Kubernetes API hostname when the domain is left blank.
 
-With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kubernetes.api_load_balancer: "main"`, and a public `main` load balancer with explicit HTTPS and Kubernetes API listeners targeting the wizard's only pool, `control-plane`. This preserves a single-VM topology when the control-plane size is one. A supplied ACME email also writes `cluster.acme`; leaving it blank keeps self-signed ingress certificates. Without a domain, it writes the supplied API hostname and leaves load-balancer and DNS wiring to the user. The domain may omit its load-balancer reference because it defaults to `main`. Dedicated ingress pools, multiple domains, load balancers, and provider-specific advanced settings remain cluster-config edits; when an `ingress` pool is added, the HTTPS listener must be changed to target it.
+With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kubernetes.api_load_balancer: "main"`, and a public `main` load balancer with explicit HTTPS and Kubernetes API listeners targeting the wizard's only pool, `control-plane`. This preserves a single-VM topology when the control-plane size is one. A supplied ACME email also writes `cluster.acme`; leaving it blank keeps self-signed ingress certificates. Without a domain, it writes the supplied API hostname and leaves load-balancer and DNS wiring to the user. The domain may omit its load-balancer reference because it defaults to `main`. Dedicated ingress pools, multiple domains, load balancers, and provider-specific advanced settings remain cluster-config edits; moving HTTPS to a dedicated `ingress` pool requires a separate logical key from the control-plane API listeners.
 
 ## Implementation plan
 
@@ -189,7 +188,7 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kuber
 - Keep the first domain as the default without adding another field.
 - Preserve the existing flat Kubernetes and registry fields.
 - Replace the singular provider `load_balancer` with a named `load_balancers` map whose entries specify `public`, `subnets`, and explicit listeners.
-- Keep `port`, optional `target_port`, and `pool` on each listener so every target group registers VMs from the selected pool.
+- Keep `port`, optional `target_port`, and `pool` on each listener; require one common pool per logical load-balancer key on both clouds.
 - Add `domains[].load_balancer`, defaulting to `main`, and optional `kubernetes.api_load_balancer` references; validate configured references resolve.
 - Validate that domain and API load-balancer references have their required listener mappings and reject duplicate external ports.
 - Add resolved helpers for the default domain and domainless registry hostname.
@@ -207,7 +206,7 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kuber
 ### 3. Expose the load-balancer DNS target
 
 - Extend the Nstance network module input to accept Podplane's explicit listener-to-target port mappings.
-- Preserve listener identity through target-group outputs so each pool registers only with its configured listeners.
+- Preserve listener identity through target-group outputs and common backend membership per logical load-balancer key; use separate keys for different pools.
 - Extend each Nstance load-balancer output with its canonical hosted-zone ID in addition to its existing DNS name.
 - Preserve named load-balancer keys through Podplane's generated Terraform and Nstance modules.
 
@@ -239,7 +238,7 @@ With a domain, it writes the domain, `k8s.<domain>`, `registry.<domain>`, `kuber
 ### 7. Verify end-to-end behavior
 
 - Add config parsing, validation, JSON Schema, wizard, Terraform generation, and Netsyseed tests.
-- Cover domainless explicit API hostnames, missing API hostname validation, no managed API load balancer, manual DNS, Route53, multiple domains, multiple load balancers, explicit target-port mappings, missing required listeners, duplicate ports, the wizard's single-pool topology, dedicated listener-specific pools, and explicit hostname overrides.
+- Cover domainless explicit API hostnames, missing API hostname validation, no managed API load balancer, manual DNS, Route53, multiple domains, multiple load balancers, explicit target-port mappings, missing required listeners, duplicate ports, the wizard's single-pool topology, separate logical keys for dedicated pools, rejection of mixed listener pools on both clouds, and explicit hostname overrides.
 - Include the shared AWS load-balancer/port-6443 scenario as an acceptance test.
 - Verify generated DNS outputs, kubeconfig connectivity, mutable API hostname updates, node-local registry pulls, port-forwarded pushes, and optional registry ingress.
 - Validate/lint generated Terraform for each supported infrastructure/DNS-provider combination before advertising that combination.

@@ -2,11 +2,12 @@
 
 > **STATUS**: In review
 >
-> The core `podplane push` path works in local clusters. Remaining work: implement
-> and verify optional Docker `/v2` and `/token` routing; verify conditional Docker
-> login; wire the production registry write identity; align default ACLs and legacy
-> hostname migration with this contract; and complete production and integrated
-> push-to-node-pull verification.
+> The core `podplane push` path, optional HTTPS Docker ingress, and native Zot
+> token exchange are implemented. GCP uses Workload Identity Federation for
+> Zot's bucket access, not a stored Google service-account key. Local verification
+> covers token exchange, ACL enforcement, and direct bearer-token pushes.
+> Production push-to-node-pull verification is still outstanding; legacy hostname
+> migration is outside MVP scope.
 
 ## Goal
 
@@ -32,7 +33,9 @@ The registry bucket remains the single backing store, with two I/O paths:
 - `deps download` already writes the registry-compatible object layout for mirrored dependency images under the registry bucket root.
 - local clusters expose a fake S3 `registry` bucket backed by the local registry cache.
 
-Do not add write credentials to vmconfig nodes.
+Do not configure write credentials in the node-local registry. On GCP, Zot uses
+its own federated Kubernetes identity; node identities have read-only access to
+the registry bucket. See the production identity boundary below.
 
 ## User experience
 
@@ -42,8 +45,9 @@ podplane push <local-image> [<remote-image>]
 
 Rules:
 
-- The source is a local Docker/containerd/OCI image reference resolvable by the CLI image library.
-- If `<remote-image>` is omitted, push to `<registry-hostname>/apps/<source-repo-basename>:<source-tag>`.
+- The source is an app image in Podplane's local registry cache, normally populated by `podplane build`. Accept `NAME[:TAG]`, `apps/<repo>[:TAG]`, or an explicit `*-registry.local/apps/<repo>[:TAG]` reference; reject arbitrary remote registries, digest references, and `mirror/**` sources.
+- If the image is missing from the cache, fall back to Docker's local image store when available, importing the image into the cache after confirmation. Do not resolve arbitrary containerd or OCI sources.
+- If `<remote-image>` is omitted, push to `<registry-hostname>/apps/<source-repo>:<source-tag>`, preserving the app repository path.
 - If `<remote-image>` omits a registry hostname, prefix the cluster registry hostname.
 - User-pushed images must live under `apps/**`; reserve `mirror/**` for Podplane-managed cached upstream images.
 - If the source tag is omitted, use `latest`.
@@ -53,7 +57,7 @@ Rules:
 
 ## Write path
 
-Use Kubernetes port-forward for the first implementation.
+`podplane push` uses Kubernetes port-forward.
 
 ```text
 podplane push
@@ -76,7 +80,7 @@ Reasons:
   - for those use cases, they must still be able to push images to the registry
 - Kubernetes authorizes the port-forward, but registry authorization is Zot OIDC ACLs against the user's Podplane OIDC token user/group claims.
 - It avoids exposing push on public ingress.
-- It works for local, AWS, and future GCP clusters with the same CLI path.
+- It uses the same CLI path for local, AWS, and GCP clusters.
 - It keeps registry writes inside Kubernetes, where the write-capable bucket identity belongs.
 
 Do not require public Gateway ingress for `podplane push`.
@@ -85,28 +89,38 @@ Do not require public Gateway ingress for `podplane push`.
 
 Standard `docker push <registry-hostname>/apps/<repo>:<tag>` must be supported if the registry ingress is explicitly enabled. Ingress is disabled by default.
 
-When enabled, `zot-registry` owns custom routing instead of using the upstream Zot chart ingress:
+The `zot-registry` wrapper uses the upstream chart's HTTPRoute support. Both paths
+reach Zot through the same HTTPS listener; no separate token service is needed:
 
 ```text
-https://<registry-hostname>/v2/...  -> Zot
-https://<registry-hostname>/token   -> registry token service
+https://<registry-hostname>/v2/...          -> Zot registry API
+https://<registry-hostname>/zot/auth/token  -> Zot native token exchange
 ```
+
+Podplane generates the route when `cluster.registry.ingress.enabled` is true.
+The registry hostname must match a `cluster.domains` zone or an immediate
+subdomain covered by its wildcard certificate. The route attaches explicitly to
+that domain's HTTPS listener on `platform-envoy-gateway`, not its HTTP listener.
+DNS must point to the ingress endpoint, and Docker must trust the serving
+certificate.
 
 Docker flow:
 
 ```text
 docker push <registry-hostname>/apps/example-api:latest
-  -> Zot challenges with WWW-Authenticate: Bearer realm="https://<registry-hostname>/token"
+  -> Zot challenges with WWW-Authenticate: Bearer realm="https://<registry-hostname>/zot/auth/token"
   -> Docker credential helper supplies the Podplane OIDC ID token as IdentityToken
-  -> Docker POSTs grant_type=refresh_token&refresh_token=<id_token>&scope=... to /token
-  -> token service validates the OIDC token and returns {"access_token":"<id_token>"}
+  -> Docker POSTs grant_type=refresh_token&refresh_token=<id_token>&scope=... to /zot/auth/token
+  -> Zot validates the OIDC token and returns it as the registry access token
   -> Docker retries Zot with Authorization: Bearer <id_token>
   -> Zot validates OIDC and applies ACLs
 ```
 
-The token service may be implemented by the Podplane operator or a smaller dedicated service. It is not in the blob data path and needs no bucket credentials.
+Zot returns the existing ID token; it does not mint a narrower token or refresh
+the user's OIDC session. Podplane's credential helper handles token renewal.
+The operator's former registry-token endpoint and chart resources are removed.
 
-`podplane login` may configure Docker automatically when Docker is installed, the registry hostname is known, and ingress/token service is enabled. Docker requires an executable named `docker-credential-podplane`; support this by letting the installed `podplane` binary detect `argv[0] == "docker-credential-podplane"` and dispatch to the same implementation as `podplane hooks docker-credentials`, so installation can create a symlink instead of shipping a second binary. Do not configure Docker for port-forward-only clusters; stock Docker cannot use Zot OIDC bearer auth without the token-service adapter.
+`podplane login` configures Docker when Docker is installed, the registry hostname is known, and registry ingress is enabled. Docker requires an executable named `docker-credential-podplane`; the installed `podplane` binary detects `argv[0] == "docker-credential-podplane"` and dispatches to the same implementation as `podplane hooks docker-credentials`, so installation can create a symlink instead of shipping a second binary. The helper accepts Docker's plain-text registry hostname and returns JSON credentials with username `<token>` and the ID token as the secret. Do not configure Docker for port-forward-only clusters.
 
 ## OIDC and ACLs
 
@@ -120,25 +134,28 @@ Configure Zot OIDC bearer auth against the same issuer and audience Podplane alr
 Default ACL groups:
 
 ```text
-podplane:registry:admin -> ** read/create/update/delete
+podplane:registry:admin -> ** read; apps/** create/update/delete
 podplane:registry:edit  -> ** read; apps/** create
 podplane:registry:view  -> ** read
-podplane:admins         -> ** read/create/update/delete
+podplane:registry:mirror -> mirror/** read/create/update/delete
+podplane:admins         -> ** read; apps/** create/update/delete
 podplane:editors        -> ** read; apps/** create
 podplane:operators      -> ** read; apps/** create
 podplane:viewers        -> ** read
-system:masters          -> ** read/create/update/delete
+system:masters          -> ** read; apps/** create/update/delete
 ```
 
-Only admin groups can write `mirror/**`. Edit groups can read all repositories and create user images under `apps/**`, but cannot update existing tags or write mirrored dependency repositories.
+Only `podplane:registry:mirror` can write `mirror/**` by default. Admin groups, including `system:masters`, have app CRUD access but read-only mirror access unless also granted that dedicated group. Edit groups can read all repositories and create user images under `apps/**`, but cannot update existing tags or write mirrored dependency repositories.
 
-`system:masters` is the Kubernetes default super-user group. `podplane:admins`, `podplane:editors`, `podplane:operators`, and `podplane:viewers` match the platform RBAC groups. Zot cannot infer arbitrary Kubernetes `ClusterRoleBinding`s from a raw OIDC token; if that becomes required, the token service must mint scoped registry tokens after Kubernetes authorization checks.
+`system:masters` is the Kubernetes default super-user group. `podplane:admins`, `podplane:editors`, `podplane:operators`, and `podplane:viewers` match the platform RBAC groups. Zot cannot infer arbitrary Kubernetes `ClusterRoleBinding`s from a raw OIDC token. Supporting those would require a separate Kubernetes-aware authorization design; native token exchange does not provide it.
 
 Expose ACLs in `zot-registry` chart values so operators can replace or extend them through `platform-components` values.
 
 ## Registry config shape
 
-Move the registry hostname to cluster-level config. Existing configs with `components.registry.mirror.hostname` should be migrated by hoisting that value to `cluster.registry.hostname`.
+The registry hostname lives in cluster-level config. Automatic migration from
+legacy `components.registry.mirror.hostname` configs is outside MVP scope; there
+are no existing users requiring that migration.
 
 ```json
 {
@@ -174,31 +191,33 @@ Add a `zot-registry` component in `podplane/components`:
 - Do not fork upstream Zot chart templates or hand-write equivalent Deployment/Service templates unless the upstream chart cannot express a required setting.
 - Chart/app key: `zot-registry`; Flux release name: `platform-zot-registry`.
 - Namespace: `platform-zot-registry`.
-- Add `zot-registry` to `platform.components.apps` and to the bootstrap chart's addon list so `bootstrap.install: recommended` and `all` enable it. Adding only the app entry is insufficient because bootstrap now renders recommended/all overrides from `bootstrap.addons.apps`.
+- Add `zot-registry` to `platform.components.apps` and to the bootstrap chart's addon list so `bootstrap.install: platform`, `agentic`, and `all` enable it. Adding only the app entry is insufficient because bootstrap renders profile-specific overrides from `bootstrap.addons.apps`.
 - Workload: Zot configured for push/pull against the existing registry bucket.
 - Service: ClusterIP named `zot-registry`, selected by `podplane push` for port-forward.
 - Dependencies: provider identity plumbing for object-store writes. Optional public
   ingress additionally depends on Envoy Gateway and the operator-owned ingress
   certificate path from [ACME.md](./ACME.md).
-- Do not add ingress, HTTPRoute, ServiceMonitor, persistence PVCs, or CRDs for the initial version.
-- No CRD chart unless a Zot operator is introduced; do not introduce one for the initial version.
-- Later Docker-compatible ingress support may add optional custom routing for `/v2/...` and `/token`; keep it disabled by default and do not use the upstream Zot chart ingress for that routing.
+- Use Zot v2.1.22 with upstream chart 0.1.128 for native token exchange.
+- Enable the upstream HTTPRoute only for opt-in Docker access, matching
+  `PathPrefix /v2` and `Exact /zot/auth/token` against the same Zot backend.
+- Keep the upstream Ingress, ServiceMonitor, and persistence PVC disabled. No Zot
+  operator or Zot-specific CRD chart is required.
 
 The component receives:
 
 - registry bucket name,
 - provider region/endpoint/path-style settings,
-- write-capable cloud identity (`registry_read_write` on AWS; the equivalent GCP service account when GCP cluster creation exists),
+- write-capable cloud identity (`registry_read_write` on AWS; Zot's federated Kubernetes service account on GCP),
 - registry hostname used by vmconfig/containerd,
 - OIDC issuer/audience/claim settings,
 - ACL values,
-- optional ingress/token-service settings.
+- optional HTTPS route settings.
 
 Object-storage credentials must not be stored in Helm values. Use cloud workload identity or mounted provider credentials. Static local test credentials are allowed only for `podplane local start` fake S3.
 
 ## Local clusters
 
-`podplane local start --components recommended` (which is the same as `podplane local start`, since `recommended` is the default) installs `zot-registry`.
+`podplane local start --components agentic` (which is the same as `podplane local start`, since `agentic` is the default) installs `zot-registry`. The `platform` profile also includes it.
 
 The in-cluster registry writes to the local fake S3 `registry` bucket. The node-local
 Podplane Registry reads that same bucket, so pushed local images are immediately
@@ -213,8 +232,31 @@ AWS `cluster create` wires:
 - vmconfig/node Podplane Registry: `REGISTRY_ASSUME_ROLE = registry_read_only`.
 - `zot-registry`: `registry_read_write`.
 
-GCP must follow the same split when `cluster create` supports GCP: the node-local
-Podplane Registry gets read-only bucket access and `zot-registry` gets write access.
+GCP generation grants node and Nstance-server identities
+`roles/storage.objectViewer` on the registry bucket. Zot's Kubernetes service
+account, `platform-zot-registry/zot-registry`, receives
+`roles/storage.objectAdmin` through a cluster-specific Workload Identity pool and
+OIDC provider. Google verifies projected service-account tokens using statically
+uploaded JWKS; the Kubernetes discovery and JWKS endpoints need not be public.
+
+Zot uses Application Default Credentials: a non-secret `external_account` config
+points to a rotating projected token. `GOOGLE_APPLICATION_CREDENTIALS` selects
+that config, and the GCS `keyfile` setting stays unset. There is no Google
+service-account JSON key or Zot credential mount through Secrets Store CSI.
+
+Cloud provisioning persists the Kubernetes signing key outside Terraform state
+and configures Nstance to deliver it to control-plane nodes. Public verification
+keys and JWKS are separate from the active private key so rotation can later
+overlap old and new verification keys. Automatic signing-key rotation is outside
+the current scope.
+
+The operator and GCP CSI provider have their own federated identities for secret
+management and shared secret reads, respectively. Application secret access
+remains governed by Kubernetes bindings, not per-application Google IAM. Cilium
+blocks ordinary Pods from Google metadata APIs while preserving host bootstrap
+services. This does not isolate a compromised host or narrow all host IAM;
+control-plane-only Netsy access and narrower Nstance secret permissions remain
+separate hardening work.
 
 ## Image layout
 
@@ -237,12 +279,12 @@ Do not make Zot a transparent pull-through cache.
 ## Implementation order
 
 1. Update component image mirror plumbing so bootstrap-installed core charts and Flux-managed app charts render the same default `mirror/<upstream-registry>/<repo>` layout.
-2. Add the `zot-registry` component, `platform-components` app entry, and bootstrap `recommended`/`all` addon entry.
+2. Add the `zot-registry` component, `platform-components` app entry, and bootstrap `platform`/`agentic`/`all` addon entry.
 3. Wire cluster/local `zot-registry` values through `platform.components.values.zot-registry` from cluster config and local start.
 4. Implement `podplane push` with port-forward plus direct bearer registry copy.
 5. In `podplane push`, verify that the `zot-registry` Service has ready endpoints before opening the port-forward.
-6. Add optional ingress routing and token service for stock Docker compatibility.
-7. Have `podplane login` configure Docker only when ingress/token-service support is enabled.
+6. Add optional HTTPS routing to Zot's registry API and native token endpoint for stock Docker compatibility.
+7. Have `podplane login` configure Docker only when registry ingress is enabled.
 8. Document both flows: `podplane push` always; `docker push` only with registry ingress enabled.
 
 ## Implementation plan
@@ -250,13 +292,13 @@ Do not make Zot a transparent pull-through cache.
 ### Repository: `github.com/podplane/components`
 
 1. Add the `zot-registry` app entry and wrapper chart around upstream Zot.
-2. Add `zot-registry` to the bootstrap chart `bootstrap.addons.apps` for `recommended` and `all`, so `podplane local start --components recommended` installs it.
+2. Add `zot-registry` to the bootstrap chart `bootstrap.addons.apps` for `platform`, `agentic`, and `all`, so `podplane local start --components agentic` installs it.
 3. Render Zot object-storage, OIDC, and ACL config from `platform.components.values.zot-registry`.
 4. Extend `platform.components.registry.mirror` with `prefix`, defaulting to `mirror`.
 5. Update `platform-components` mirror value rendering and comments so mirrored component images use `<mirror-hostname>/<mirror-prefix>/<upstream-registry>/<repo>:<tag>` with the default prefix `mirror`.
 6. Update bootstrap chart/apply wiring so initially-installed core images (`cilium`, `coredns`, `fluxcd`) use the same mirror prefix layout as Flux-managed components.
-7. Keep ingress/HTTPRoute, token service, ServiceMonitor, PVCs, and CRDs out of the initial chart.
-8. Later add optional custom routing for `/v2/...` to Zot and `/token` to the token service.
+7. Keep ServiceMonitor, persistence PVCs, and Zot-specific CRDs disabled or absent.
+8. Use upstream HTTPRoute support for optional `/v2/...` and `/zot/auth/token` routing to Zot; remove the former operator token-service resources.
 
 ### Repository: `github.com/podplane/podplane`
 
@@ -267,13 +309,14 @@ Do not make Zot a transparent pull-through cache.
 5. Update local-start example output, tests, and docs that currently show unprefixed mirror refs.
 6. Implement `podplane push <local-image> [<remote-image>]` using port-forward and direct bearer-token registry auth.
 7. Add `podplane hooks docker-credentials` and `argv[0] == "docker-credential-podplane"` dispatch.
-8. Configure Docker during `podplane login` only when registry ingress/token service is enabled.
+8. Configure Docker during `podplane login` only when registry ingress is enabled.
 9. Update registry/vmconfig docs so mirror examples use `<registry-hostname>/mirror/...` and app examples use `<registry-hostname>/apps/...`.
 
 ### Repository: `github.com/podplane/operator`
 
-1. Add the optional registry token endpoint for Docker ingress mode. Keep the endpoint stateless, out of the blob data path, and without bucket credentials.
-2. Accept Docker refresh-token POSTs, validate the Podplane OIDC ID token, and return matching `token` and `access_token` plus `expires_in`.
+Remove the former registry token endpoint, its startup flags, and its config.
+Zot owns both registry requests and Docker token exchange; the operator has no
+registry-authentication responsibility.
 
 ### Repository: `github.com/podplane/vmconfig`
 
@@ -282,10 +325,12 @@ Propagate every `REGISTRY_*` value required by its object-store and hostname con
 
 ## Security invariants
 
-- Nodes never receive write-capable registry bucket credentials.
+- The node-local registry is configured with read-only bucket access. On GCP,
+  Zot's federated identity has registry write access; no writer key is delivered
+  through node credentials. Host compromise remains outside this boundary.
 - Public ingress is disabled by default.
 - `podplane push` does not require ingress.
-- Stock Docker support requires the token-service adapter; do not claim Docker compatibility without it.
+- Stock Docker uses Zot's native token exchange through HTTPS ingress, not an operator adapter.
 - Zot authorization is based on OIDC claims and ACLs, with operator-overridable policy.
-- The only bucket writer is the in-cluster registry component.
+- Zot is the configured application-image writer; node-local registry services expose no write API.
 - Existing mirrored dependency image layout remains compatible with the node-local Podplane Registry.

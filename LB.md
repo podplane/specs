@@ -25,7 +25,7 @@ Nstance registers agent-healthy instances with AWS target groups or Google Cloud
 
 ## Scale-to-zero proxy
 
-For supported AWS/Google clusters using the `recommended` seed, Podplane generates wake-capable routing and vmconfig enables a separate, minimal `nstance-server proxy` systemd service on every `nst` (nstance-server) VM using a generated environment setting. This requires no Podplane sleep-policy flag and does not enable automatic sleep. The service remains running while the tenant is awake and asleep; Nstance changes routing, not its process lifecycle. Deployments without sleep support leave the optional service disabled. Nstance/operator defaults own policy and timing; Podplane generates no overrides. The nstance-server control-plane process is never publicly exposed.
+For supported AWS/Google clusters using the `platform` or `agentic` seed, Podplane generates wake-capable routing and vmconfig enables a separate, minimal `nstance-server proxy` systemd service on every `nst` (nstance-server) VM using a generated environment setting. This requires no Podplane sleep-policy flag and does not enable automatic sleep. The service remains running while the tenant is awake and asleep; Nstance changes routing, not its process lifecycle. Deployments without sleep support leave the optional service disabled. Nstance/operator defaults own policy and timing; Podplane generates no overrides. The nstance-server control-plane process is never publicly exposed.
 
 Each shard leader manages its configured proxy listeners. While a local tenant is asleep, a listener whose group has nonzero preserved size routes NLB or tunnel traffic to the local `nstance-server proxy`; a zero-sized group does not advertise that wake target. After a shard leadership change, the new leader installs its routes and the old leader removes or disarms its routes; no server-to-server forwarding is required.
 
@@ -364,7 +364,7 @@ In NLB mode, Podplane generates one target-group or frontend entry for each expo
 
 Validation requires public/direct external placement for `nst` VMs whenever Podplane Managed NAT is enabled. Cloud Managed NAT defaults `nst` placement to private.
 
-Supported Podplane AWS/Google `recommended` deployments generate API and ingress routes capable of reaching `nstance-server proxy` in either mode without a sleep-policy flag. Podplane user config has no `SleepPolicy` and generates no policy/timing overrides; automatic sleep remains disabled by default and manual CLI sleep remains supported. Nstance and Components retain their own policy settings. Generic Nstance deployments require a proxy-reachable exposure method or a guaranteed `wake_at` for recovery; Podplane must not allow an indefinitely sleeping cluster with no wake path.
+Supported Podplane AWS/Google `platform` or `agentic` deployments generate API and ingress routes capable of reaching `nstance-server proxy` in either mode without a sleep-policy flag. Podplane user config has no `SleepPolicy` and generates no policy/timing overrides; automatic sleep remains disabled by default and manual CLI sleep remains supported. Nstance and Components retain their own policy settings. Generic Nstance deployments require a proxy-reachable exposure method or a guaranteed `wake_at` for recovery; Podplane must not allow an indefinitely sleeping cluster with no wake path.
 
 ### Proposed credential preflight
 

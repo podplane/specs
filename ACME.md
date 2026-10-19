@@ -3,8 +3,10 @@
 > **STATUS**: In review
 >
 > Issuance, fallback, backend storage, and SDS delivery are substantially
-> implemented. Remaining work: verify Envoy Gateway recognizes the
-> extension-gated pointer and that invalid initial material prevents TLS serving;
+> implemented, including independent per-domain SDS hot-update isolation and
+> certificate metrics. Initial loading remains fail-closed across configured
+> resources. Remaining verification: verify Envoy Gateway
+> recognizes the extension-gated pointer and that invalid initial material prevents TLS serving;
 > and prove public Route53 issuance, renewal, fallback, and private-material
 > exclusion from etcd, xDS, control-plane memory, logs, events, and status in an
 > integrated cluster.
@@ -111,7 +113,7 @@ Each Gateway listener references a core Secret in the Gateway namespace. That Se
 
 The private combined PEM bundle remains in the configured external Secrets backend. Secrets Store CSI mounts only the exact per-domain bundle into each Envoy data-plane Pod. A hardened Podplane SDS sidecar in that Pod reads the mount and serves the certificate to the co-located Envoy process over a Pod-local Unix domain socket. The socket is carried on a shared in-memory volume and is inaccessible over the Pod network. The sidecar runs as non-root with a read-only root filesystem, no privilege escalation, all Linux capabilities dropped, and read-only access to the certificate mount; Envoy receives neither external-provider credentials nor direct access to that mount.
 
-The sidecar validates key correspondence, exact apex-and-wildcard SANs, chain signatures, validity, and server-authentication usage before publishing an SDS generation. It detects CSI's atomic mount updates, sends a complete validated generation over SDS, and retains the last-known-good generation across malformed, partial, or temporarily unavailable updates. Envoy hot-reloads successful SDS updates without a data-plane Pod restart. Initial invalid or absent material prevents the sidecar from starting, leaves the SDS socket unavailable, and prevents Envoy from completing TLS handshakes. Envoy Gateway does not observe runtime SDS availability, so Gateway API listener conditions may remain `Programmed`; readiness for this failure is a data-plane serving property rather than a listener-status transition. Later failures preserve the prior valid listener and emit bounded diagnostics without certificate or key material.
+The sidecar validates key correspondence, exact apex-and-wildcard SANs, chain signatures, validity, and server-authentication usage before publishing an SDS generation. It detects CSI's atomic mount updates, publishes each validated domain resource independently over SDS, and retains that resource's last-known-good generation across malformed, partial, or temporarily unavailable updates without blocking other domains. Envoy hot-reloads successful SDS updates without a data-plane Pod restart. Initial invalid or absent material prevents the sidecar from starting, leaves the SDS socket unavailable, and prevents Envoy from completing TLS handshakes. Envoy Gateway does not observe runtime SDS availability, so Gateway API listener conditions may remain `Programmed`; readiness for this failure is a data-plane serving property rather than a listener-status transition. Later failures preserve the prior valid listener and emit bounded diagnostics without certificate or key material.
 
 The Envoy Gateway control plane sees only the pointer Secret metadata and SDS configuration. Ingress private-key bytes must never enter etcd, xDS resources emitted by the Envoy Gateway control plane, control-plane memory, logs, events, or status. They exist only in the external backend, CSI/provider and node mount path, SDS sidecar memory, the UDS exchange, and Envoy data-plane memory.
 

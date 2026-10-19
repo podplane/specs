@@ -1,6 +1,6 @@
 # gVisor by Default
 
-> **STATUS**: Ready for implementation
+> **STATUS**: In review
 
 Related specification: [RBAC](./RBAC.md).
 
@@ -33,7 +33,14 @@ not a grant of host-root privileges.
 - Existing-cluster migration, staged fleet activation, legacy-Pod inventory, or
   backward-compatible upgrade and rollback paths for this feature.
 
-## Current behavior
+## Historical baseline
+
+The following describes the pre-gVisor baseline, not the current implementation.
+Kubernetes nodes now configure both runtimes and probe gVisor before starting
+kubelet. Components now owns `platform-runtime`, and its bootstrap installs and
+checks runtime admission before Cilium. An additional seed-based managed
+runtime-admission readiness gate is deferred, not an MVP implementation gap;
+runtime configuration and chart presence alone do not prove admission behavior.
 
 - `podplane/vmconfig` configures containerd with runc as its default and only
   configured runtime. The shared container-runtime template is used by `knd`,
@@ -354,8 +361,9 @@ Fresh managed-cluster bootstrap must proceed in this order:
    namespaces and gVisor elsewhere. Bootstrap must not depend on Cilium or Flux to
    install policies that need to precede them. Flux subsequently reconciles the
    same platform policy resources rather than a second policy implementation.
-4. Managed platform readiness requires runtime defaulting and enforcement to be
-   active. Standard tenant access must not be enabled before that boundary.
+4. Runtime defaulting and enforcement must be active before standard tenant
+   access. An additional managed runtime-admission readiness gate is deferred;
+   vmconfig already probes gVisor before starting kubelet.
 
 No temporary tenant bypass, automatic mass restart, or legacy migration phase is
 required for fresh-cluster bootstrap.
@@ -403,7 +411,7 @@ environment, not a managed platform with the tenant runtime guarantee.
 | --- | --- |
 | `--components=none` | Both node runtimes installed; containerd defaults to runc. No platform-provided RuntimeClasses or runtime admission policies. |
 | Minimal components | Full gVisor defaulting and runc-exception enforcement. |
-| Recommended/all components | The same enforcement, with additional services. |
+| Platform/agentic/all components | The same enforcement, with additional services. |
 
 Keep RuntimeClasses and runtime admission policies owned by components; do not
 install a duplicate policy lifecycle through vmconfig. Minimal installations must
@@ -535,8 +543,9 @@ and worker, exercising default and overridden runtime values.
 - Representative restricted-default applications work on amd64 and arm64,
   including network access, persistent storage, resource limits, logs, and shell
   operations allowed by existing RBAC. Document unsupported operations.
-- A fresh minimal managed cluster enforces the full runtime contract before
-  reporting platform readiness, without requiring `podplane-operator`.
+- A fresh minimal managed cluster enforces the full runtime contract without
+  requiring `podplane-operator`. Additional managed runtime-admission readiness
+  integration is deferred rather than an MVP acceptance gate.
 - A bare cluster retains runc defaults and API-server Pod Security, with no
   platform runtime policy installed. Installing components activates enforcement
   without claiming to sandbox pre-existing experimental Pods.
