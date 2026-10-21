@@ -276,6 +276,71 @@ This is a hard requirement. AWS uses the single CSI provider slug `aws` for both
 
 For GCP, Podplane must use the upstream Google Secret Manager Secrets Store CSI provider with `SecretProviderClass.spec.provider: gcp` and the normal Secrets Store CSI Driver `secrets-store.csi.k8s.io`. Podplane is its own Kubernetes distribution, not GKE, so it must not use the GKE managed add-on provider slug `gke` or the GKE-specific CSI driver `secrets-store-gke.csi.k8s.io`.
 
+### Binding provider inheritance
+
+Most clusters use one secrets provider. Application manifests should not need to
+name that provider. `SecretProviderBinding.spec.providerName` is optional:
+
+- Omitted: resolve the current `cluster.secrets.default_provider` from operator
+  runtime configuration on every reconciliation. Do not write the resolved name
+  into the binding spec or install a static CRD default.
+- Explicit: use that configured provider, regardless of changes to the default.
+  This pins the provider name, not the configuration behind that name.
+- A supplied name must be non-empty and satisfy the provider-name schema. If an
+  omitted name has no configured default, or the selected name is not configured,
+  report `Ready=False` with reason `Invalid`. Do not select the sole provider
+  implicitly, fall back from an unknown explicit name, or fail over on backend errors.
+- Successful reconciliation records the effective name and kind in
+  `status.provider.name` and `status.provider.kind`. The `kubectl get` Provider
+  column shows the resolved status name. On resolution failure, leave any existing
+  owned `SecretProviderClass` unchanged; status may retain the last reconciled
+  provider, so consumers must also check `Ready`.
+
+Operator configuration is loaded at startup; live reload is not required. Updating
+the cluster default requires propagating it to operator runtime configuration and
+restarting the operator. Its initial binding watch reconciles existing bindings.
+Bindings with omitted names then follow the new default; explicit names stay pinned.
+Templates and deploy must preserve omission rather than resolve the default themselves.
+
+This inheritance applies only to bindings. Aggregated API requests remain explicitly
+provider-qualified for RBAC, audit logs, and encryption destination binding. The CLI
+continues resolving its default from the cached cluster summary; it does not infer a
+provider from a workload binding. For pinned workloads, users must select the matching
+provider with `podplane secret --provider` when it differs from the cluster default.
+
+### Provider migration and rollout
+
+Changing the default changes routing, not stored values. The operator must not copy
+or migrate values automatically. For a cluster-wide lift-and-shift, platform admins:
+
+1. Configure the destination backend, operator/workload permissions, and CSI provider.
+2. Copy or re-create required keys using direct backend access or explicit
+   `podplane secret ... --provider <destination>` writes. Pause writes for final
+   synchronization and verify destination values and provider-specific path mappings.
+3. Update provider-qualified RBAC grants and the cluster default, propagate operator
+   configuration, and restart the operator. Refresh CLI summaries with login/local
+   start before resuming default-provider writes.
+4. Wait for affected bindings to report the destination provider and `Ready=True`.
+   Roll affected workloads and verify their mounts and application behavior before
+   retiring the old backend. Retain the source for rollback until verification passes;
+   rolling back after destination writes requires synchronizing those writes first.
+
+CSI driver/provider pods need restarting when their configuration requires it, but
+restarting infrastructure pods alone does not guarantee application refresh.
+[CSI auto rotation](https://secrets-store-csi-driver.sigs.k8s.io/topics/secret-auto-rotation)
+can refresh mounted files when enabled; applications must reload them, and consumers
+of synced Secret environment variables require workload pod restarts. A provider
+switch is not an atomic cluster-wide cutover.
+
+For a selected-workload migration, copy the destination keys, explicitly set that
+binding's `providerName`, wait for reconciliation, and roll/verify the workload.
+
+Install the updated operator and packaged CRD before deploying templates or manifests
+that omit `providerName`. Existing explicit names remain pinned, including names
+previously inserted by deploy. To opt those bindings into inheritance, remove the
+provider field from their Helm values/manifests and reconcile them after validating
+the current default. The operator must not remove existing explicit selections.
+
 ## Component and dependency wiring
 
 Podplane should manage Secrets Store CSI Driver and provider installation through `podplane/components`, not through ad hoc manifests in the operator or templates. The platform components chart should include component entries for:
@@ -324,20 +389,15 @@ Deploy/template integration should also allow provider selection through templat
 podplane deploy worker --name aok-source-controller --secret github-private-key
 ```
 
-Deploy should resolve the cluster default secrets provider before rendering the default secrets item created by `--secret`. Template charts should expose provider selection as a stable template value so advanced users can select a non-default provider with `--set` or values files. The rendered `SecretProviderBinding.spec.providerName` must reference the same provider selected for `podplane secret create/update`; otherwise the generated `SecretProviderClass` will mount from a different backend than the one developers wrote to.
+Deploy must leave `providerName` omitted from the default secrets item created by `--secret` unless the user selects a provider. Template charts expose optional provider selection as a stable template value for explicit pinning with `--set` or values files. The operator-resolved provider must match the provider selected for `podplane secret create/update`; otherwise the generated `SecretProviderClass` will mount from a different backend than the one developers wrote to.
 
 App templates that can render a `SecretProviderBinding`, such as `web`, should declare a static dependency on `podplane-operator` and `secrets-store-csi-driver` so deploy can enable the Podplane CRD/controller, CSI CRDs, and CSI driver before Helm renders the template. Templates should not statically declare a dependency on every concrete provider, because provider selection is cluster-config-driven and may be supplied through the default provider or values. The happy path is that `podplane cluster create`, `podplane local start`, or `podplane install` has already enabled the provider component that matches the selected/default provider.
 
-The `podplane secret` implementation does not support automatically migrating values between providers. However, users can move workloads explicitly:
+Neither `podplane secret` nor the operator migrates values automatically. Follow the
+[provider migration and rollout procedure](#provider-migration-and-rollout) before
+changing the default or pinning selected workloads to a destination provider.
 
-1. Configure the new provider in cluster config.
-2. Re-create or copy required keys into the new provider, e.g. `podplane secret create ... --provider openbao`.
-3. Redeploy or update the workload's `SecretProviderBinding` using template values such as `--set secrets[0].providerName=openbao`.
-4. After workloads are confirmed on the new provider, delete old-provider keys using `--provider <old-provider>`.
-
-The operator should not automatically move secret values between providers.
-
-Deploy should support one `SecretProviderBinding` through simple CLI flags in the initial UX. For the simple CLI path, deploy should create one binding named exactly the deploy `--name`; the operator then generates a same-namespace `SecretProviderClass` with that same name. If the user does not select a provider through values, deploy should set `spec.providerName` to the resolved `cluster.secrets.default_provider`. Secret keys should be passed with a repeatable flag, matching existing deploy conventions for `--env` and `--set`:
+Deploy should support one `SecretProviderBinding` through simple CLI flags in the initial UX. For the simple CLI path, deploy should create one binding named exactly the deploy `--name`; the operator then generates a same-namespace `SecretProviderClass` with that same name. If the user does not select a provider through values, deploy and templates must leave `spec.providerName` absent so the binding follows the current cluster default. Secret keys should be passed with a repeatable flag, matching existing deploy conventions for `--env` and `--set`:
 
 ```sh
 podplane deploy web \
@@ -360,7 +420,6 @@ Template values should use an array so values files can express multiple SecretP
 ```yaml
 secrets:
   - bindingName: aok-source-controller
-    providerName: aws-secrets-manager
     mountPath: /var/run/podplane/secrets
     items:
       - key: github-private-key
@@ -373,14 +432,13 @@ The repeatable `--secret` flag appends items to the CLI-generated default `secre
 ```yaml
 secrets:
   - bindingName: <deploy --name>
-    providerName: <cluster.secrets.default_provider>
     mountPath: /var/run/podplane/secrets
     items:
       - key: <first --secret value>
       - key: <second --secret value>
 ```
 
-For values-file-defined items, `providerName` may default to `cluster.secrets.default_provider`; `bindingName` and `mountPath` should be required because multiple items are expected to be intentionally distinct. Users can set array values with Helm-style `--set` index syntax, for example:
+For values-file-defined items, `providerName` is optional and remains omitted in the rendered binding when absent; the operator resolves the default at reconciliation time. `bindingName` and `mountPath` should be required because multiple items are expected to be intentionally distinct. Users can pin a provider with Helm-style `--set` index syntax, for example:
 
 ```sh
 podplane deploy web \
@@ -452,7 +510,6 @@ metadata:
   namespace: platform-aok
   name: aok-source-controller
 spec:
-  providerName: aws-secrets-manager
   mountPath: /var/run/podplane/secrets
   items:
     - key: github-private-key
@@ -461,9 +518,14 @@ spec:
   syncToKubernetesSecrets: []
 ```
 
-`spec.providerName` is the cluster-local provider name from Podplane cluster config, not the upstream Secrets Store CSI provider slug. The operator resolves it to a provider kind such as `aws`, `gcp`, `vault`, or `openbao`.
+This example follows the cluster default because `spec.providerName` is absent.
+To pin it, add `spec.providerName: aws-secrets-manager`. The optional name is a
+cluster-local provider name from Podplane cluster config, not the upstream Secrets
+Store CSI provider slug. The operator resolves the explicit or default name to a
+provider kind such as `aws`, `gcp`, `vault`, or `openbao`.
 
-`SecretProviderBinding` status should expose the resolved provider and generated implementation resource:
+`SecretProviderBinding` status should expose the resolved provider and generated
+implementation resource. With `aws-secrets-manager` selected as the cluster default:
 
 ```yaml
 status:
@@ -489,7 +551,10 @@ metadata:
     secrets.podplane.dev/secret-provider-binding: aok-source-controller
 ```
 
-Provider identity should live on the owning `SecretProviderBinding` spec/status. If platform teams update the provider configuration behind a provider name, the operator should reconcile any provider-specific SecretProviderClass changes from the binding.
+An explicit provider selection lives in the owning `SecretProviderBinding` spec;
+the last successfully reconciled provider lives in status. After operator config
+reload through restart, the operator reconciles provider-specific SecretProviderClass
+changes from updated provider configuration or an inherited default change.
 
 Example AWS Secrets Manager `SecretProviderClass` rendering:
 
@@ -1099,7 +1164,8 @@ Raw `SecretProviderClass` should remain the cluster-operator escape hatch for ad
 Initial `SecretProviderBinding` policy:
 
 - Treat `metadata.namespace + metadata.name` as the SecretProviderClass/backend prefix boundary.
-- Require `spec.providerName` to reference a configured cluster provider name.
+- Allow `spec.providerName` to be omitted and resolve the current cluster default on every reconciliation. Explicit names must reference a configured provider and remain pinned across default changes; never persist a resolved default in the spec.
+- Report unresolved providers as `Ready=False` with reason `Invalid`, leaving any previously generated `SecretProviderClass` unchanged. Do not fall back from invalid explicit names or on backend failures.
 - Require every `spec.items[].key` item to satisfy the Podplane key-name rules and every `spec.items[].path` value to satisfy CSI-safe relative path rules.
 - Generate one owned `SecretProviderClass` with the same namespace/name as the binding.
 - For every generated backend secret, use the configured cluster-wide secrets prefix:
@@ -1391,7 +1457,7 @@ This is a new repository for the `podplane-operator` service and the main owner 
 
 - Add the namespaced `SecretProviderBinding` CRD in API group `secrets.podplane.dev/v1beta1`.
 - Implement reconciliation from `SecretProviderBinding` to an owned same-namespace `SecretProviderClass` with the same name.
-- Select provider configuration from `spec.providerName` and resolve provider status as `status.provider.name` plus `status.provider.kind`.
+- Make `spec.providerName` optional with no static CRD default. Select its explicit provider or the current runtime `secrets.default_provider` on every reconciliation without spec write-back. Record the resolved provider in `status.provider.name` plus `status.provider.kind`, and use the status name for the Provider printer column.
 - Generate provider-specific `SecretProviderClass` syntax for AWS, OpenBao, Vault, and GCP from `spec.items[]` items and safe provider config.
 - Implement `syncToKubernetesSecrets` by translating `data[].fromKey` to upstream `secretObjects[].data[].objectName` using the matching resolved mounted relative path: `spec.items[].path` when set, otherwise `spec.items[].key`.
 - Set a controller `ownerReference` from generated `SecretProviderClass` to the owning `SecretProviderBinding`, plus labels/annotations for the binding name.
@@ -1445,7 +1511,7 @@ This repository owns Podplane app template Helm charts and template manifest met
 
 - Add template chart support for mounting secrets via Secrets Store CSI, including rendered `SecretProviderBinding` resources where a template opts into secrets.
 - Add deploy/template rendering for AWS Parameter Store vs AWS Secrets Manager based on the selected provider's config, including `kind: aws` and `object_type`, not on the provider name alone.
-- Add deploy/template rendering for Vault/OpenBao/GCP providers, including `providerName` on rendered `SecretProviderBinding` resources.
+- Support all configured providers through bindings; render `providerName` only when explicitly supplied, and preserve omission for operator-time default inheritance. Make provider selection optional in chart schemas while retaining validation when supplied.
 - Add static `podplane-operator` and `secrets-store-csi-driver` dependency metadata to app templates that can render `SecretProviderBinding` resources, without statically depending on every provider-specific CSI plugin.
 - Keep CSI Kubernetes Secret sync opt-in only.
 - Update template manifests so secret-capable templates expose the required component dependencies and image metadata.
@@ -1497,8 +1563,9 @@ This repository owns the Podplane CLI, cluster config, local-cluster behavior, d
 
 #### Deploy and template integration
 
-- Extend Podplane app templates/deploy UX to mount secrets via Secrets Store CSI, defaulting the selected provider from the cluster summary and allowing values-file/`--set` provider selection.
-- Ensure `podplane deploy` passes provider selection and safe provider template fields to templates without exposing credentials or sensitive backend access details.
+- Extend Podplane app templates/deploy UX to mount secrets via Secrets Store CSI, preserving omitted provider names and allowing explicit values-file/`--set` provider pinning.
+- Remove deploy-time default-provider injection and the `--secret` requirement for a cached default provider. The operator owns binding default resolution; CLI secret operations still use the cached summary and provider-qualified API.
+- Ensure `podplane deploy` passes only explicit provider selection without exposing credentials or sensitive backend access details.
 
 ### End-of-work testing and verification
 
@@ -1508,6 +1575,7 @@ Run repository-local checks after implementation in each repo, then run cross-re
 
 - Add tests for Kubernetes-style API object responses, discovery, named `SecretProviderKeyspace` request handling, stale-key `409 Conflict`, create/update/archive/restore/destroy semantics, boundary delete/destroy behavior, metadata-only listing, and custom-verb `SubjectAccessReview` enforcement.
 - Add tests for `SecretProviderBinding` reconciliation, generated `SecretProviderClass` ownership, collision handling, status provider fields, and provider-specific path generation.
+- Verify omitted-provider bindings follow default changes across reconciliations without spec mutation, explicit names remain pinned, and missing/unknown defaults or explicit providers report `Invalid` without changing an existing generated class.
 - Add AWS-specific rendering tests for generated `objectName`, `objectType`, object aliases, `syncToKubernetesSecrets` translation, and absence of full ARNs, `jmesPath`, `failoverObject`, and historical versions from generated resources.
 - Add Vault/OpenBao/GCP rendering tests for supported upstream formats and absence of historical versions and GKE managed add-on shapes from generated resources.
 - Validate AWS backend behavior with Secrets Store CSI AWS provider.
@@ -1516,11 +1584,13 @@ Run repository-local checks after implementation in each repo, then run cross-re
 #### `github.com/podplane/components`
 
 - Validate chart rendering for the singleton `platform-podplane-operator` Deployment, Service, APIService, bootstrap workload-CA CSI mount, serving-certificate runtime volume, workload-CA injection annotation, `SecretProviderBinding` CRD, RBAC helper roles, aggregation labels, CEL pod policy, and component metadata. Assert absence of cert-manager resources and TLS Secrets.
+- Update and verify the packaged binding CRD permits omission without defaulting, and the chart passes the cluster default into operator configuration. This packaged-CRD update is pending the operator/template review.
 - Verify no chart default creates broad user bindings or an `aggregate-to-view` secrets role.
 
 #### `github.com/podplane/templates`
 
 - Validate template rendering for AWS Parameter Store, AWS Secrets Manager, Vault, OpenBao, and GCP `SecretProviderBinding` resources and CSI volume mounts.
+- Verify web and worker schemas/rendering accept omitted providers without materializing a field, preserve explicit providers, and reject invalid supplied names.
 - Verify secret-capable templates depend on `podplane-operator` and `secrets-store-csi-driver` but not every provider-specific CSI plugin.
 - Verify CSI Kubernetes Secret sync remains opt-in.
 
@@ -1539,6 +1609,7 @@ Run repository-local checks after implementation in each repo, then run cross-re
 #### `github.com/podplane/podplane`
 
 - Add CLI tests for `--provider` defaulting, create, update, list, delete, restore, destroy, `--all`, `--destroy`, `--hide-archived`, `--stdin`, encrypted `--dry-run=client -o yaml`, and stale-key retry behavior.
+- Verify deploy leaves the provider omitted without requiring a cached default and preserves explicit values-file/`--set` choices. This deploy change is pending the operator/template review.
 - Add config/summary tests ensuring only safe provider fields are persisted and sensitive backend access details are excluded.
 - Add dependency and `netsyseed` tests ensuring provider kinds enable Secrets Store CSI Driver/CRDs and the matching provider components, and local clusters always enable/download OpenBao provider support.
 - Add focused tests for the local end-to-end path.
@@ -1550,4 +1621,5 @@ Run repository-local checks after implementation in each repo, then run cross-re
 - Verify local `podplane secret create/update/list/delete/restore/destroy` flows go through `podplane CLI -> kube-apiserver -> podplane operator aggregated API -> configured provider adapter`.
 - Verify the local Secrets Store CSI OpenBao provider can mount values written by `podplane secret` through fakevault-compatible API behavior.
 - Verify `SecretProviderBinding` reconciliation generates backend paths under the expected prefix and avoids historical version references.
+- After the packaged-CRD and deploy changes land, verify default inheritance through deploy and operator restart, explicit pinning, refreshed CLI summaries/provider-scoped RBAC, and workload remounts during a controlled provider migration. Do not claim a live provider migration from renderer tests alone.
 - Verify the native CEL pod-side policy prevents a workload from mounting a different service account's `SecretProviderClass`, rejects Secrets Store CSI pods with omitted or empty `serviceAccountName`, and allows the explicit `secretProviderClass == serviceAccountName` convention.
