@@ -38,10 +38,19 @@ invalid. `encryption-key` is reserved and cannot be a source credential name.
 The initial release reserves this key for encrypted OAuth token storage so a
 future upgrade needs no new secret mount.
 
-The chart runs UID 0 inside a private Pod user namespace (`hostUsers: false`),
-where it maps to a unique unprivileged host UID. This allows direct, rotating
-`0400` secret mounts without a privileged copying sidecar. Eligible Linux nodes
-must support Pod user namespaces and idmapped mounts.
+By default the chart runs UID 0 inside a private Pod user namespace
+(`hostUsers: false`), where it maps to a unique unprivileged host UID. This
+allows direct, rotating `0400` secret mounts without a privileged copying
+sidecar. Eligible Linux nodes must support Pod user namespaces and idmapped
+mounts.
+
+Runtimes that cannot join a Pod user namespace, such as gVisor, set
+`hostUsers: true` with a non-root `podSecurityContext` that includes an
+`fsGroup`. Kubelet makes native Secret and projected files group-readable
+through `fsGroup`, and Secrets Store CSI files keep their default `0644` mode.
+The chart rejects `hostUsers: true` with UID 0 or without an `fsGroup`.
+Podplane uses this mode with UID, GID, and `fsGroup` 65532, because its
+platform namespaces default to gVisor.
 
 ## Architecture
 
