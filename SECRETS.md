@@ -1058,10 +1058,12 @@ Provider adapters should use the safest native deletion mode that makes the curr
 | --- | --- | --- | --- | --- |
 | AWS Secrets Manager | Schedule deletion with recovery window | `RestoreSecret` | `ForceDeleteWithoutRecovery`; recreate may need retry due eventual consistency | `archived` during recovery window | Yes; scheduled-for-deletion secrets are not directly accessible |
 | AWS Parameter Store | Not supported; archive delete should fail | Not supported | Delete parameter | Hidden after destroy | Yes |
-| GCP Secret Manager | Disable all retained enabled versions | Re-enable only latest | Destroy disabled archived version(s); reject if any version is enabled | `archived` while latest is disabled | Yes; `latest` does not fall back to an older enabled version |
+| GCP Secret Manager | Disable all retained enabled versions | Re-enable only latest | Destroy archived versions, then delete the secret object; reject empty objects and enabled/unknown versions | `archived` while latest is disabled; hidden after destroy | Yes; `latest` does not fall back to an older enabled version |
 | Vault/OpenBao KV-v2 | Soft-delete latest version | Undelete latest version | Delete metadata for the logical key | `archived` while soft-deleted | Yes |
 
 If a provider uses a recoverable/archive-style delete, Podplane should expose restore for that provider/key within the provider-defined recovery window. Providers without native recovery should reject archive delete and require explicit destroy.
+
+For GCP, only the successful `CreateSecret` caller may add the initial version. Existing empty or destroyed objects must never be populated by create. An abandoned empty object requires administrator recovery after stopping and draining its creators. Destroy captures the parent ETag before checking all versions, verifies the parent is unchanged, and destroys disabled versions using their ETags. Once all versions are destroyed, it deletes the parent with the original ETag, allowing fresh creation. Retry may finish deleting an object whose versions are already destroyed. Stop and drain other writers before GCP destroy or recovery: [version changes do not update the parent ETag](https://cloud.google.com/secret-manager/docs/etags), so these checks do not prevent concurrent version additions. Existing clusters must apply the updated prefix-scoped `secretmanager.secrets.delete` permission before operator rollout; retain version-destroy permission and the workload-CA exclusion.
 
 For Vault/OpenBao KV-v2, Podplane operator does not expose per-version operations. A Podplane key maps to one logical KV-v2 metadata path. `delete` should soft-delete the latest/current version so normal CSI reads of the key fail. `restore` should undelete that soft-deleted latest/current version. `destroy` should delete the KV-v2 metadata path for the logical key, permanently removing all versions and metadata so the key disappears from `podplane secret list`, cannot be restored, and can be recreated as a clean logical key. `destroy --all` should delete metadata for every Podplane-managed key under the selected SecretProviderClass prefix.
 
@@ -1507,7 +1509,7 @@ This is a new repository for the `podplane-operator` service and the main owner 
 - Implement Vault KV-v2 adapter.
 - Implement GCP Secret Manager adapter.
 - For Vault/OpenBao, support create, update, metadata-only list, soft delete of the latest/current version, undelete/restore, and destroy as KV-v2 metadata delete for the logical key; do not expose per-version operations.
-- For GCP Secret Manager, support create, update, metadata-only list, delete as disabling all retained enabled versions, restore as re-enabling only latest, and destroy as destroying disabled archived version(s) after rejecting any enabled version.
+- For GCP Secret Manager, implement creator-only initialization, archive of all enabled versions, latest-only restore, and ETag-checked destruction of archived versions and their secret object as specified above.
 - Extend `SecretProviderBinding` rendering for Vault/OpenBao and upstream GCP SecretProviderClass formats; generated resources must avoid GKE managed add-on provider/driver shapes and provider-specific historical version references.
 
 ### Repository: `github.com/podplane/components`
