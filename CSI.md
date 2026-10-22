@@ -1,6 +1,11 @@
 # Persistent Volumes
 
-> **STATUS**: Ready for implementation
+> **STATUS**: In review
+>
+> Implementation is complete in components, vmconfig, and the CLI. Local checks
+> cover chart rendering and generation, IAM output, qcow2 lifecycle, and simulated
+> host LVM preparation. VM and cloud integration checks have not been run;
+> Google's federated-identity release gate remains outstanding.
 
 Related specifications: [GVISOR](./GVISOR.md), [REGISTRY](./REGISTRY.md)
 (Google workload identity federation).
