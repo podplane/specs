@@ -190,7 +190,11 @@ same external backend
 
 The aggregated API is the secret value write/control path. `SecretProviderBinding` is the declarative read/mount configuration path. Secrets Store CSI Driver is the workload read/mount path.
 
-The CLI should never write directly to a provider backend, including in local clusters. It should always call the Kubernetes API. The operator should then use the configured backend adapter for the cluster.
+`podplane secret` commands always use the Kubernetes API, including on local clusters.
+Pre-cluster Terraform and local bootstrap provision secrets directly in the backend.
+Bootstrap values are text: PEM keys and Source Gateway's base64 encryption key need
+no additional encoding. Secrets Manager bootstrap writes and adoption require `SecretString`;
+invalid existing keys must fail validation, never be replaced automatically.
 
 ## Support for Multiple Secrets Providers
 
@@ -275,6 +279,22 @@ Initial provider kind mapping:
 This is a hard requirement. AWS uses the single CSI provider slug `aws` for both Secrets Manager and Parameter Store, so provider-specific configuration must choose the AWS `objectType` separately (`secretsmanager` or `ssmparameter`). For Vault and OpenBao, Podplane's developer write path is explicitly KV-v2, even though the CSI read path can support broader Vault/OpenBao secret engines. The operator adapter docs should document that write-path contract.
 
 For GCP, Podplane must use the upstream Google Secret Manager Secrets Store CSI provider with `SecretProviderClass.spec.provider: gcp` and the normal Secrets Store CSI Driver `secrets-store.csi.k8s.io`. Podplane is its own Kubernetes distribution, not GKE, so it must not use the GKE managed add-on provider slug `gke` or the GKE-specific CSI driver `secrets-store-gke.csi.k8s.io`.
+
+### Value formats
+
+Writes default to UTF-8 text, preserved exactly, including whitespace and newlines.
+Text works across all supported backends without making applications decode ordinary
+passwords, JSON, or PEM files. Binary writes are explicit; provider limits still apply.
+
+| Backend | Text storage | Binary storage | CSI mounts for binary writes |
+| --- | --- | --- | --- |
+| AWS Secrets Manager | `SecretString` | `SecretBinary` | Original bytes |
+| GCP Secret Manager | `SecretPayload.data` | `SecretPayload.data` | Original bytes |
+| AWS Parameter Store | `SecureString` | Base64 in `SecureString` | Base64 text |
+| Vault / OpenBao KV-v2, including fakevault | JSON string in `value` | Base64 string in `value` | Base64 text unless the binding enables decoding |
+
+Binary-to-text storage uses standard padded base64. Transport encryption and API
+base64 fields do not change these stored-value rules.
 
 ### Binding provider inheritance
 
@@ -764,7 +784,7 @@ algorithm: x25519-hkdf-sha256-aes-256-gcm
 
 The operator public key is a base64-encoded raw X25519 public key. The CLI should accept standard padded base64 and unpadded base64url encodings; the operator should emit one canonical encoding consistently in `publickeys/latest`. For each create/update encryption, the CLI should generate a fresh ephemeral X25519 sender keypair, derive a shared secret with the operator public key, derive a 32-byte content-encryption key using HKDF-SHA-256 with the ephemeral sender public key as salt and info string `podplane secrets v1`, then encrypt the value with AES-256-GCM using a fresh random nonce. The ephemeral sender public key and nonce are included in the ciphertext envelope. This per-encryption ephemeral key is not the operator key and does not affect the 6-hour (but configurable) operator key rotation window.
 
-Bind the ciphertext to its destination by using AES-GCM associated data that the operator can reconstruct from the request and cluster identity. The associated data should include the canonical `encryptedValue.algorithm` value plus the Podplane cluster ID, Kubernetes namespace, `SecretProviderKeyspace` resource name, and entry key. This prevents a ciphertext captured from one Podplane secret destination from being replayed into another destination while the same operator key is still active. Do not include fields that clients cannot know during `--dry-run=client` generation, such as the cluster-wide secrets prefix.
+Bind the ciphertext to its destination by using AES-GCM associated data that the operator can reconstruct from the request and cluster identity. The associated data should include the canonical `encryptedValue.algorithm` value plus the Podplane cluster ID, Kubernetes namespace, `SecretProviderKeyspace` resource name, entry key, and binary mode. This prevents changing the destination or binary mode of an encrypted value. Do not include fields that clients cannot know during `--dry-run=client` generation, such as the cluster-wide secrets prefix.
 
 The canonical AES-GCM associated-data byte string is UTF-8 text made by joining these fields in this exact order with a single NUL byte (`0x00`) between fields and no leading/trailing separator:
 
@@ -774,12 +794,13 @@ clusterID
 metadata.namespace
 metadata.name
 spec.entries[i].key
+spec.entries[i].binary ("false" when omitted, otherwise "true" or "false")
 ```
 
 For example:
 
 ```text
-x25519-hkdf-sha256-aes-256-gcm\0prod-cluster\0platform-aok\0aws-secrets-manager.aok-source-controller\0github-private-key
+x25519-hkdf-sha256-aes-256-gcm\0prod-cluster\0platform-aok\0aws-secrets-manager.aok-source-controller\0github-private-key\0false
 ```
 
 The operator must reconstruct the same byte string before AES-GCM decryption. Do not include `encryptedValue.keyID`, the envelope version, the operator public key, the cluster-wide secrets prefix, backend path, provider kind, operation, or any field unavailable to `--dry-run=client`.
@@ -903,6 +924,10 @@ PUT /apis/secrets-api.podplane.dev/v1beta1/namespaces/platform-aok/secretprovide
 ```
 
 The provider is selected by the `SecretProviderKeyspace` resource name prefix. `PUT` with `operation: create` creates a new key and must fail if the key already exists or is archived. `PUT` with `operation: update` updates an existing active key and must fail if the key is missing or archived. Updating an existing value is more sensitive than creating a new key, so the operator must perform an explicit Kubernetes `SubjectAccessReview` for custom verb `overwrite` before executing `operation: update`. The `encryptedValue` field is required for each `spec.entries[]` item in create/update requests and omitted from normal read/list responses. For v1, the CLI sends exactly one entry; the API shape allows bulk writes later.
+
+For create/update, `spec.entries[].binary` defaults to `false` (UTF-8 text); `true`
+accepts raw bytes. Decrypt and validate every entry before any backend writes,
+without including values in errors. Restore does not accept binary mode.
 
 Successful create/update response:
 
@@ -1167,6 +1192,7 @@ Initial `SecretProviderBinding` policy:
 - Allow `spec.providerName` to be omitted and resolve the current cluster default on every reconciliation. Explicit names must reference a configured provider and remain pinned across default changes; never persist a resolved default in the spec.
 - Report unresolved providers as `Ready=False` with reason `Invalid`, leaving any previously generated `SecretProviderClass` unchanged. Do not fall back from invalid explicit names or on backend failures.
 - Require every `spec.items[].key` item to satisfy the Podplane key-name rules and every `spec.items[].path` value to satisfy CSI-safe relative path rules.
+- For Vault/OpenBao, optional `spec.items[].binary: true` renders CSI `encoding: base64`; omission or `false` leaves decoding off. Reject the field, even `false`, for other providers after resolving the explicit or cluster-default provider. Do not set a CRD default: omission must remain distinguishable from an explicit value.
 - Generate one owned `SecretProviderClass` with the same namespace/name as the binding.
 - For every generated backend secret, use the configured cluster-wide secrets prefix:
 
@@ -1269,6 +1295,7 @@ Behavior:
 - `create` prompts securely by default and fails if the key already exists.
 - `update` prompts securely by default, requires custom `overwrite` RBAC permission, and fails if the key does not already exist.
 - `--stdin` supports automation without shell-history exposure.
+- `--binary` on create/update accepts raw bytes instead of UTF-8 text; do not pre-encode input. Use text mode for PEM and application-defined base64 strings. See [value formats](#value-formats) for storage and mount behavior.
 - `--dry-run=client -o yaml` encrypts the value with `publickeys/latest` and prints a `SecretProviderKeyspace` manifest without writing it. This only requires `get` on `publickeys/latest`, so a user without write permission can securely pass the encrypted manifest to someone with the matching named `secretproviderkeyspaces` update permission to submit. Submitting an update/overwrite manifest also requires custom verb `overwrite`.
 - `--provider` selects a configured backend provider. The CLI must have a cached Podplane cluster summary for the selected Kubernetes context, must verify that an explicit `--provider` is one of the configured provider names in that summary, and must use the summary's cluster ID when constructing encryption associated data. If `--provider` is omitted, the CLI resolves the cluster default provider from the cached summary and sends it explicitly to the API.
 - `create` and `update` encrypt the value with the operator's current public key before sending it through the Kubernetes API.
@@ -1617,6 +1644,8 @@ Run repository-local checks after implementation in each repo, then run cross-re
 
 #### Cross-repo end-to-end
 
+- Verify text round trips unchanged through CLI/API, bootstrap, and CSI; invalid UTF-8 in text mode fails before writes without exposing values.
+- Verify binary storage/mount behavior against the provider table, binary-mode tampering fails decryption, and binding validation uses the resolved provider.
 - Stand up a local cluster with the components chart, `podplane-operator`, Secrets Store CSI Driver, and OpenBao provider enabled.
 - Verify local `podplane secret create/update/list/delete/restore/destroy` flows go through `podplane CLI -> kube-apiserver -> podplane operator aggregated API -> configured provider adapter`.
 - Verify the local Secrets Store CSI OpenBao provider can mount values written by `podplane secret` through fakevault-compatible API behavior.
